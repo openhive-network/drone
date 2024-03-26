@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 //use actix_web::rt::time::sleep;
 use tokio::sync::RwLock;
 use chrono::DateTime;
-use actix_request_identifier::{RequestId, RequestIdentifier};
+use actix_request_identifier::{RequestId, RequestIdentifier, IdReuse};
 
 use log::{error, warn, info, debug, trace, log_enabled, Level::Info};
 
@@ -133,7 +133,9 @@ impl ResponseTrackingInfo {
         reply_builder.insert_header(("X-Jussi-Namespace", self.mapped_method.namespace));
         reply_builder.insert_header(("X-Jussi-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
         reply_builder.insert_header(("X-Jussi-Method", self.mapped_method.method));
-        reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
+        // removed params because it can be huge for posts, and can easily overflow nginx 
+        // proxy buffer
+        // reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
         if self.backend_url.is_some() {
             reply_builder.insert_header(("X-Jussi-Backend-Url", self.backend_url.unwrap()));
         }
@@ -239,7 +241,7 @@ impl Expiry<String, CacheEntry> for MyExpiry {
 
 /// This is a helper function used for ExpireIfReversible methods.  This is called on the result
 /// of the backend call to get the block number of the item returned
-fn get_block_number_from_result(result: &Value) -> Option<u32> {
+fn get_block_number_from_result(result: &Value, request_id: &RequestId) -> Option<u32> {
     // appbase get_block
     if let Some(block_num) = result.pointer("/block/block_id").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
         return Some(block_num);
@@ -257,7 +259,7 @@ fn get_block_number_from_result(result: &Value) -> Option<u32> {
         return Some(prev_block_num + 1);
     }
 
-    error!("get_block_number_from_result() was unable to find the block number.  This may mean you marked an unsupported method as ExpireIfReversible");
+    error!(request_id=request_id.as_str(); "get_block_number_from_result() was unable to find the block number.  This may mean you marked an unsupported method as ExpireIfReversible");
     None
 }
 
@@ -269,7 +271,7 @@ fn get_block_number_from_result(result: &Value) -> Option<u32> {
 // Waiting seems better, because if we don't, the client will probably just make the same request
 // again (maybe after a short sleep).  And if we do it right, it may give them the block sooner
 // than their polling loop would have.
-async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: &web::Data<AppData>) {
+async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: &web::Data<AppData>, request_id: &RequestId) {
     if mapped_method.method == "get_block" {
         if let Some(block_num) = mapped_method.params.as_ref().and_then(|v| v["block_num"].as_u64()) {
             let current_head_block_number = data.blockchain_state.read().await.head_block_number;
@@ -278,13 +280,13 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
                 // time someone called get_dynamic_global_properties.
                 // we should also check that now() is < the predicted time the requested
                 // block will be produced
-                info!("future block requested: {block_num}, head is {current_head_block_number}");
+                info!(request_id=request_id.as_str(); "future block requested: {block_num}, head is {current_head_block_number}");
             }
         }
     }
 }
 
-async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String) -> CacheEntry {
+async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, request_id: &RequestId) -> CacheEntry {
     let endpoint = match data.config.lookup_url(mapped_method.get_method_name_parts()) {
         Some(endpoint) => { endpoint }
         None => {
@@ -310,7 +312,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     };
 
     let upstream_request = mapped_method.format_for_upstream(&data.config);
-    debug!("Making upstream request for {method_and_params_str}");
+    debug!(request_id=request_id.as_str(); "Making upstream request for {method_and_params_str}");
     // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
@@ -333,6 +335,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Err(err) => {
             let mut error_message = err.without_url().to_string();
             error_message.push_str(&endpoint.to_string());
+            debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -355,6 +358,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     let body = match res.text().await {
         Ok(text) => text,
         Err(err) => {
+            debug!(request_id=request_id.as_str(); "Received an invalid response from the endpoint: {err}");
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -373,6 +377,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     let mut json_body: serde_json::Value = match serde_json::from_str(&body) {
         Ok(parsed) => parsed,
         Err(err) => {
+            debug!(request_id=request_id.as_str(); "Unable to parse endpoint data: {err}");
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -389,6 +394,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         }
     };
     if json_body["error"].is_object() {
+        trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", json_body["error"]);
         return CacheEntry {
             result: Err(ErrorData {
                 error: json_body["error"].take(),
@@ -403,7 +409,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // if the call was to get_dynamic_global_properties, save off the last irreversible block
     let mapped_method_ref = &tracking_info.as_ref().unwrap().mapped_method;
     let method_name_only = &mapped_method_ref.method;
-    debug!("Mapped method is {}", method_name_only);
+    debug!(request_id=request_id.as_str(); "Mapped method is {}", method_name_only);
     if method_name_only == "get_dynamic_global_properties" {
         let new_lib = json_body["result"]["last_irreversible_block_num"].as_u64().map(|v| v as u32);
         let new_head = json_body["result"]["head_block_number"].as_u64().map(|v| v as u32);
@@ -423,7 +429,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 }
             }
             _ => {
-                warn!("Invalid get_dynamic_global_properties result, ignoring");
+                warn!(request_id=request_id.as_str(); "Invalid get_dynamic_global_properties result, ignoring");
             }
         }
     }
@@ -439,14 +445,14 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     else
     {
         let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
-        debug!("lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
+        debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
 
         match ttl_from_config {
             TtlValue::NoCache => { CacheTtl::NoCache }
             TtlValue::NoExpire => { CacheTtl::NoExpire }
             TtlValue::ExpireIfReversible => {
                 // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-                if let Some(block_number) = get_block_number_from_result(&json_body["result"]) {
+                if let Some(block_number) = get_block_number_from_result(&json_body["result"], request_id) {
                     let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
                     if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
                 } else {
@@ -461,6 +467,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         }
     };
 
+    trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result: json_body["result"].take(),
@@ -487,7 +494,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         }
     )?;
 
-    check_for_future_block_requests(&mapped_method, data).await;
+    check_for_future_block_requests(&mapped_method, data, request_id).await;
 
     if log_enabled!(target: "access_log", Info) {
         // Get humantime for logging.
@@ -528,10 +535,11 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
 
     let mut upstream_was_called = false;
     let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
-                                                 async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone()).await }).await;
+                                                 async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
 
     match cache_entry.result {
         Ok(api_call_response) => {
+            trace!(request_id=request_id.as_str(); "Result was a regular non-error response, upstream_was_called = {upstream_was_called}");
             let mut response = APICallResponse {
                 jsonrpc: request.jsonrpc,
                 id: request.id,
@@ -544,6 +552,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             Ok(response)
         }
         Err(error_data) => {
+            trace!(request_id=request_id.as_str(); "Result was an error response, upstream_was_called = {upstream_was_called}, http status should be {}", error_data.http_status);
             let mut response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
@@ -593,8 +602,10 @@ async fn api_call(
                 Ok(response) => {
                     let mut reply_builder = HttpResponse::Ok();
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
-                    if let Some(tracking_info) = response.tracking_info {
-                        tracking_info.into_headers(&mut reply_builder);
+                    if data.config.drone.add_jussi_headers {
+                        if let Some(tracking_info) = response.tracking_info {
+                            tracking_info.into_headers(&mut reply_builder);
+                        }
                     }
                     reply_builder.json(serde_json::json!({
                         "jsonrpc": response.jsonrpc,
@@ -603,6 +614,7 @@ async fn api_call(
                     }))
                 },
                 Err(err) => {
+                    debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
                     let mut reply_builder = HttpResponse::build(err.http_status);
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
                     if let Some(tracking_info) = err.tracking_info {
@@ -701,15 +713,9 @@ async fn main() -> std::io::Result<()> {
     });
     info!("Drone is running on port {}.", app_config.drone.port);
     HttpServer::new(move || {
-        // let cors = Cors::default()
-        //     .allowed_methods(vec!["GET", "POST"])
-        //     .allowed_headers(vec![header::DNT, HeaderName::from_static("keep-alive"), header::USER_AGENT, HeaderName::from_static("x-requested-with"), header::IF_MODIFIED_SINCE, header::CACHE_CONTROL, header::CONTENT_TYPE, header::CONTENT_RANGE, header::RANGE])
-        //     .allow_any_origin()
-        //     .send_wildcard();
-        let cors = Cors::permissive();
         App::new()
-            .wrap(cors)
-            .wrap(RequestIdentifier::with_uuid())
+            .wrap(RequestIdentifier::with_uuid().use_incoming_id(IdReuse::UseIncoming))
+            .wrap(Condition::new(app_config.drone.add_cors_headers, Cors::permissive()))
             .app_data(
                 web::JsonConfig::default()
                     .content_type(|_| true)

@@ -18,11 +18,14 @@ pub enum TtlValue {
     DurationInSeconds(u32)
 }
 
+fn default_to_true() -> bool { true }
+
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
 pub struct DroneConfig {
     /// the port to listen on
     pub port: u16,
+
     /// the endpoint (usually an IP like 0.0.0.0, but can be a hostname if you're weird)
     pub hostname: String,
 
@@ -35,6 +38,14 @@ pub struct DroneConfig {
 
     /// number of threads used for connections between drone and the backends
     pub middleware_connection_threads: usize,
+
+    /// whether to add cors headers
+    #[serde(default = "default_to_true")]
+    pub add_cors_headers: bool,
+
+    /// whether to add jussi debugging headers for analysis scripts to parse
+    #[serde(default)]
+    pub add_jussi_headers: bool,
 }
 
 
@@ -118,7 +129,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),
