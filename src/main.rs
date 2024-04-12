@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use chrono::DateTime;
 use actix_request_identifier::{RequestId, RequestIdentifier, IdReuse};
+use sha256::digest;
 
 use log::{error, warn, info, debug, trace, log_enabled, Level::Info};
 
@@ -136,6 +137,9 @@ impl ResponseTrackingInfo {
         // removed params because it can be huge for posts, and can easily overflow nginx 
         // proxy buffer
         // reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
+        // instead print the hash of the parameters, we can use that to tell which calls are
+        // identical even if we don't know exactly what the parameters were
+        reply_builder.insert_header(("X-Jussi-Param-Hash", digest(self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string()))));
         if self.backend_url.is_some() {
             reply_builder.insert_header(("X-Jussi-Backend-Url", self.backend_url.unwrap()));
         }
