@@ -710,6 +710,8 @@ async fn main() -> std::io::Result<()> {
             .build(),
         webclient: ClientBuilder::new()
             .pool_max_idle_per_host(app_config.drone.middleware_connection_threads)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .timeout(Duration::from_secs(90))
             .build()
             .unwrap(),
         config: app_config.clone(),
