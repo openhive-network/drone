@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+.gitlab-ci.yml
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Documentation
+*.md
+README*
+LICENSE*
+
+# CI/CD
+.gitlab/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test coverage
+*.profraw
+*.profdata
