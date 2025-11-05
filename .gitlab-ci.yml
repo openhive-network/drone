@@ -1,0 +1,74 @@
+stages:
+  - build
+  - publish-develop
+  - publish-release
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_BUILDKIT: 1
+  IMAGE_NAME: drone
+
+build_image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - export BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+    - |
+      docker build \
+        --build-arg BUILD_TIME="$BUILD_TIME" \
+        --build-arg GIT_COMMIT_SHA="$CI_COMMIT_SHA" \
+        --build-arg GIT_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+        -t "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA" \
+        .
+    - docker push "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+  tags:
+    - public-runner-docker
+
+publish_develop:
+  stage: publish-develop
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker pull "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY/hive/$IMAGE_NAME:develop"
+    - docker push "$CI_REGISTRY/hive/$IMAGE_NAME:develop"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  tags:
+    - public-runner-docker
+
+publish_release:
+  stage: publish-release
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - echo "$BLOG_REGISTRY_PASSWORD" | docker login -u "$BLOG_REGISTRY_USER" --password-stdin registry-upload.hive.blog
+  script:
+    - export BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+    # Build the release image
+    - |
+      docker build \
+        --build-arg BUILD_TIME="$BUILD_TIME" \
+        --build-arg GIT_COMMIT_SHA="$CI_COMMIT_SHA" \
+        --build-arg GIT_COMMIT_SHORT_SHA="$CI_COMMIT_SHORT_SHA" \
+        -t "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_TAG" \
+        .
+    # Tag for hive.blog registry
+    - docker tag "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_TAG" "registry-upload.hive.blog/$IMAGE_NAME:$CI_COMMIT_TAG"
+    # Push to both registries
+    - docker push "$CI_REGISTRY/hive/$IMAGE_NAME:$CI_COMMIT_TAG"
+    - docker push "registry-upload.hive.blog/$IMAGE_NAME:$CI_COMMIT_TAG"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^[v01].*/ && $CI_COMMIT_REF_PROTECTED == "true"'
+  tags:
+    - public-runner-docker
