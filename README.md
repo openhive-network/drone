@@ -1,7 +1,7 @@
 # Drone
 
 Drone is an API caching layer application for the Hive blockchain. It is built using Rust with Actix Web, and its primary purpose is to cache and serve API requests for a specific set of methods.
-Drone is totally meant to be a Jussi replacement, it aims to improve API node performance.
+Drone is meant to be a Jussi replacement, it aims to improve API node performance.
 
 ## Features
 
@@ -14,7 +14,7 @@ Drone is totally meant to be a Jussi replacement, it aims to improve API node pe
 
 ## Cached API Methods
 
-The list of which methods are cached and their cache TTL is configured in the config.yaml file.  The keys used to specify the method names in the config file Jussi's rules for parsing
+The list of which methods are cached and their cache TTL is configured in the config.yaml file.  The keys used to specify the method names in the config file follow Jussi's rules for parsing
 method names, so you should be able to port your existing Jussi config.json easily.
 
 

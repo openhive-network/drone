@@ -339,7 +339,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Err(err) => {
             let mut error_message = err.without_url().to_string();
             error_message.push_str(&endpoint.to_string());
-            debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
+            debug!(request_id=request_id.as_str(); "Error making upstream request: {error_message}");
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -691,7 +691,7 @@ async fn main() -> std::io::Result<()> {
     // Load config.
     let app_config = config::parse_file("config.yaml");
 
-    // helpers for the cach
+    // helpers for the cache
     let expiry = MyExpiry;
     let eviction_listener = |key, _value, cause| {
         debug!("Evicted key {key}. Cause: {cause:?}");
