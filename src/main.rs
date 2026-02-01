@@ -22,6 +22,9 @@ use config::{AppConfig, TtlValue};
 pub mod method_renamer;
 use method_renamer::MethodAndParams;
 
+pub mod metrics;
+use metrics::DroneMetrics;
+
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 
@@ -72,6 +75,13 @@ async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
     }).collect();
 
     HttpResponse::Ok().json(entries)
+}
+
+async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
+    let metrics_text = appdata.metrics.encode();
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(metrics_text)
 }
 
 // Enum for API Requests, either single or batch.
@@ -291,8 +301,10 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
 }
 
 async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, request_id: &RequestId) -> CacheEntry {
-    let endpoint = match data.config.lookup_url(mapped_method.get_method_name_parts()) {
-        Some(endpoint) => { endpoint }
+    let backend_start = Instant::now();
+
+    let backend = match data.config.lookup_backend(mapped_method.get_method_name_parts()) {
+        Some(backend) => { backend }
         None => {
             return CacheEntry {
                 result: Err(ErrorData {
@@ -324,13 +336,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     let tracking_info = Some(ResponseTrackingInfo {
         cached: false,
         mapped_method,
-        backend_url: Some(endpoint.to_string()),
+        backend_url: Some(backend.url.clone()),
         upstream_method: Some(upstream_request.method.clone())
     });
 
     // Send the request to the endpoints.
     let res = match client
-        .post(endpoint)
+        .post(&backend.url)
         .json(&upstream_request)
         .send()
         .await
@@ -338,8 +350,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Ok(response) => response,
         Err(err) => {
             let mut error_message = err.without_url().to_string();
-            error_message.push_str(&endpoint.to_string());
-            debug!(request_id=request_id.as_str(); "Error making upstream request: {error_message}");
+            error_message.push_str(&backend.url);
+            debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -430,6 +442,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
                         write_lock.head_block_time = SystemTime::from(current_head_block_time);
                     }
+                    // Update blockchain state metrics
+                    data.metrics.update_blockchain_state(new_head, new_lib);
                 }
             }
             _ => {
@@ -471,6 +485,16 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         }
     };
 
+    // Record backend duration metrics
+    let backend_duration = backend_start.elapsed().as_secs_f64();
+    data.metrics.record_backend_duration(
+        &mapped_method_ref.namespace,
+        mapped_method_ref.api.as_deref().unwrap_or(""),
+        &mapped_method_ref.method,
+        &backend.name,
+        backend_duration
+    );
+
     trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
     CacheEntry {
         result: Ok(ApiCallResponseData {
@@ -483,8 +507,12 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 }
 
 async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId) -> Result<APICallResponse, ErrorStructure> {
+    let request_start = Instant::now();
+    data.metrics.inc_active_requests();
+
     // perform any requested mappings, this may give us different method names & and params
-    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| 
+    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| {
+        data.metrics.dec_active_requests();
         ErrorStructure {
             jsonrpc: request.jsonrpc.clone(),
             id : request.id.clone(),
@@ -496,7 +524,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             http_status: StatusCode::NOT_FOUND,
             tracking_info: None
         }
-    )?;
+    })?;
 
     check_for_future_block_requests(&mapped_method, data, request_id).await;
 
@@ -541,6 +569,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
                                                  async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
 
+    let duration_seconds = request_start.elapsed().as_secs_f64();
+    data.metrics.dec_active_requests();
+
     match cache_entry.result {
         Ok(api_call_response) => {
             trace!(request_id=request_id.as_str(); "Result was a regular non-error response, upstream_was_called = {upstream_was_called}");
@@ -550,9 +581,20 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 result: api_call_response.result,
                 tracking_info: api_call_response.tracking_info
             };
+            let cached = !upstream_was_called;
             if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+                response.tracking_info.as_mut().unwrap().cached = cached;
             }
+
+            // Record success metrics
+            data.metrics.record_request_success(
+                &mapped_method.namespace,
+                mapped_method.api.as_deref().unwrap_or(""),
+                &mapped_method.method,
+                cached,
+                duration_seconds
+            );
+
             Ok(response)
         }
         Err(error_data) => {
@@ -560,13 +602,28 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             let mut response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
-                error: error_data.error,
+                error: error_data.error.clone(),
                 http_status: error_data.http_status,
                 tracking_info: error_data.tracking_info
             };
+            let cached = !upstream_was_called;
             if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+                response.tracking_info.as_mut().unwrap().cached = cached;
             }
+
+            // Record error metrics - extract error code from JSON error object
+            let error_code = error_data.error.get("code")
+                .and_then(|c| c.as_i64())
+                .unwrap_or(-32000) as i32;
+            data.metrics.record_request_error(
+                &mapped_method.namespace,
+                mapped_method.api.as_deref().unwrap_or(""),
+                &mapped_method.method,
+                error_code,
+                cached,
+                duration_seconds
+            );
+
             Err(response)
         }
     }
@@ -682,7 +739,8 @@ struct AppData {
     cache: Cache<String, CacheEntry>,
     webclient: Client,
     config: AppConfig,
-    blockchain_state: Arc<RwLock<BlockchainState>>
+    blockchain_state: Arc<RwLock<BlockchainState>>,
+    metrics: Arc<DroneMetrics>,
 }
 
 #[actix_web::main]
@@ -691,7 +749,7 @@ async fn main() -> std::io::Result<()> {
     // Load config.
     let app_config = config::parse_file("config.yaml");
 
-    // helpers for the cache
+    // helpers for the cach
     let expiry = MyExpiry;
     let eviction_listener = |key, _value, cause| {
         debug!("Evicted key {key}. Cause: {cause:?}");
@@ -700,14 +758,34 @@ async fn main() -> std::io::Result<()> {
         value.size
     };
 
+    // Initialize metrics
+    let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
+
     // Create the cache.
-    let _cache = web::Data::new(AppData {
-        cache: Cache::builder()
-            .max_capacity(app_config.drone.cache_max_capacity)
-            .expire_after(expiry)
-            .eviction_listener(eviction_listener)
-            .weigher(weigher)
-            .build(),
+    let cache = Cache::builder()
+        .max_capacity(app_config.drone.cache_max_capacity)
+        .expire_after(expiry)
+        .eviction_listener(eviction_listener)
+        .weigher(weigher)
+        .build();
+
+    // Clone cache and metrics for background task
+    let cache_for_metrics = cache.clone();
+    let metrics_for_task = Arc::clone(&metrics);
+
+    // Spawn background task to update cache metrics every 15 seconds
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let size_bytes = cache_for_metrics.weighted_size();
+            let entry_count = cache_for_metrics.entry_count();
+            metrics_for_task.update_cache_metrics(size_bytes, entry_count);
+        }
+    });
+
+    let app_data = web::Data::new(AppData {
+        cache,
         webclient: ClientBuilder::new()
             .pool_max_idle_per_host(app_config.drone.middleware_connection_threads)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -715,11 +793,20 @@ async fn main() -> std::io::Result<()> {
             .build()
             .unwrap(),
         config: app_config.clone(),
-        blockchain_state: Arc::new(RwLock::new(BlockchainState::new()))
+        blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
+        metrics,
     });
+
+    let metrics_enabled = app_config.drone.metrics_enabled;
+    let metrics_path = app_config.drone.metrics_path.clone();
+
     info!("Drone is running on port {}.", app_config.drone.port);
+    if metrics_enabled {
+        info!("Prometheus metrics enabled at {}", metrics_path);
+    }
+
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .wrap(RequestIdentifier::with_uuid().use_incoming_id(IdReuse::UseIncoming))
             .wrap(Condition::new(app_config.drone.add_cors_headers, Cors::permissive()))
             .app_data(
@@ -728,12 +815,19 @@ async fn main() -> std::io::Result<()> {
                     .content_type_required(false)
                     .limit(1024 * 100),
             ) // 100kb
-            .app_data(_cache.clone())
+            .app_data(app_data.clone())
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
             .route("/cache-entries", web::get().to(cache_entries))
-            .route("/cache-size", web::get().to(cache_size))
+            .route("/cache-size", web::get().to(cache_size));
+
+        // Add metrics endpoint if enabled
+        if metrics_enabled {
+            app = app.route(&metrics_path, web::get().to(metrics_handler));
+        }
+
+        app
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
