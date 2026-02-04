@@ -21,6 +21,8 @@ pub enum TtlValue {
 fn default_to_true() -> bool { true }
 fn default_metrics_path() -> String { "/metrics".to_string() }
 fn default_metrics_namespace() -> String { "drone".to_string() }
+fn default_access_log_format() -> String { "simple".to_string() }
+fn default_empty_string() -> String { String::new() }
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -48,6 +50,18 @@ pub struct DroneConfig {
     /// whether to add jussi debugging headers for analysis scripts to parse
     #[serde(default)]
     pub add_jussi_headers: bool,
+
+    /// access log format: "simple" (human-readable) or "json" (detailed, stats.py compatible)
+    #[serde(default = "default_access_log_format")]
+    pub access_log_format: String,
+
+    /// optional file path for JSON access logs (empty string = disabled)
+    #[serde(default = "default_empty_string")]
+    pub access_log_file: String,
+
+    /// whether to flush access log file after every line (default: false, uses buffered writes with periodic flush)
+    #[serde(default)]
+    pub access_log_flush_every_line: bool,
 
     /// whether to enable Prometheus metrics endpoint
     #[serde(default)]
@@ -150,7 +164,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string()},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string()},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),

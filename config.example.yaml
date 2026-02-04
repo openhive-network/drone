@@ -5,6 +5,20 @@ drone:
   cache_max_capacity: 4294967296 # 4GB
   operator_message: "Drone by Deathwing"
   middleware_connection_threads: 8
+  # Access log format for console: "simple" (human-readable, default) or "json" (detailed)
+  # JSON format logs: time_local, status, request, remote_addr, namespace, api, method,
+  #                   request_time, backend_time, cache_hit, request_body, request_id
+  # Use with RUST_LOG=warn,access_log=info to enable console access logging
+  access_log_format: simple
+  # Optional file path for JSON access logs (empty = disabled)
+  # When set, JSON access logs are written to this file regardless of access_log_format
+  # File logging uses buffered writes (32KB) with 5-second periodic flushes for performance
+  # Use external tools like logrotate with copytruncate for log rotation
+  access_log_file: ""
+  # Flush access log file after every line (default: false)
+  # When false, uses buffered writes with 5-second periodic flushes for better performance
+  # When true, flushes immediately after each log entry (higher I/O but no delay)
+  access_log_flush_every_line: false
   # Prometheus metrics configuration
   metrics_enabled: true        # Enable/disable the /metrics endpoint
   metrics_path: "/metrics"     # Path for Prometheus scraping
