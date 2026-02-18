@@ -19,6 +19,10 @@ pub enum TtlValue {
 }
 
 fn default_to_true() -> bool { true }
+fn default_metrics_path() -> String { "/metrics".to_string() }
+fn default_metrics_namespace() -> String { "drone".to_string() }
+fn default_access_log_format() -> String { "simple".to_string() }
+fn default_empty_string() -> String { String::new() }
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -46,8 +50,39 @@ pub struct DroneConfig {
     /// whether to add jussi debugging headers for analysis scripts to parse
     #[serde(default)]
     pub add_jussi_headers: bool,
+
+    /// access log format: "simple" (human-readable) or "json" (detailed, stats.py compatible)
+    #[serde(default = "default_access_log_format")]
+    pub access_log_format: String,
+
+    /// optional file path for JSON access logs (empty string = disabled)
+    #[serde(default = "default_empty_string")]
+    pub access_log_file: String,
+
+    /// whether to flush access log file after every line (default: false, uses buffered writes with periodic flush)
+    #[serde(default)]
+    pub access_log_flush_every_line: bool,
+
+    /// whether to enable Prometheus metrics endpoint
+    #[serde(default)]
+    pub metrics_enabled: bool,
+
+    /// path for the Prometheus metrics endpoint
+    #[serde(default = "default_metrics_path")]
+    pub metrics_path: String,
+
+    /// namespace prefix for Prometheus metrics
+    #[serde(default = "default_metrics_namespace")]
+    pub metrics_namespace: String,
 }
 
+
+/// Backend information containing both the URL and friendly name
+#[derive(Debug, Clone)]
+pub struct BackendInfo {
+    pub url: String,
+    pub name: String,
+}
 
 /// AppConfig holds the parsed, ready-to-use configuration
 #[derive(Debug, Clone)]
@@ -55,14 +90,14 @@ pub struct AppConfig {
     pub drone: DroneConfig,
     backends: HashMap<String, String>,
     pub translate_to_appbase: HashSet<String>,
-    pub urls: SequenceTrie<String, String>,
+    pub urls: SequenceTrie<String, BackendInfo>,
     pub ttls: SequenceTrie<String, TtlValue>,
     pub timeouts: SequenceTrie<String, u32>,
     pub equivalent_methods: HashMap<String, String>,
 }
 
 impl AppConfig {
-    pub fn lookup_url(&self, method_name_parts: Vec<&String>) -> Option<&String> {
+    pub fn lookup_backend(&self, method_name_parts: Vec<&String>) -> Option<&BackendInfo> {
         self.urls.get_ancestor(method_name_parts)
     }
     pub fn lookup_ttl(&self, method_name_parts: Vec<&String>) -> Option<&TtlValue> {
@@ -129,7 +164,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string()},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),
@@ -151,7 +186,10 @@ pub fn parse_file(filename: &str) -> AppConfig {
     for (method, backend_name) in config.urls {
         let parts: Vec<String> = method.split('.').map(|v| v.to_string()).collect();
         let url = app_config.backends.get(&backend_name).unwrap_or_else(|| panic!("Undefined backend \"{}\" for method \"{}\"", backend_name, method));
-        app_config.urls.insert_owned(parts, url.clone());
+        app_config.urls.insert_owned(parts, BackendInfo {
+            url: url.clone(),
+            name: backend_name,
+        });
     }
     for (method, ttl) in config.ttls {
         let parts: Vec<String> = method.split('.').map(|v| v.to_string()).collect();

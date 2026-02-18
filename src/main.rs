@@ -4,8 +4,10 @@ use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
-use std::sync::{Arc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 //use actix_web::rt::time::sleep;
 use tokio::sync::RwLock;
 use chrono::DateTime;
@@ -21,6 +23,9 @@ use config::{AppConfig, TtlValue};
 
 pub mod method_renamer;
 use method_renamer::MethodAndParams;
+
+pub mod metrics;
+use metrics::DroneMetrics;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -72,6 +77,13 @@ async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
     }).collect();
 
     HttpResponse::Ok().json(entries)
+}
+
+async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
+    let metrics_text = appdata.metrics.encode();
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4; charset=utf-8")
+        .body(metrics_text)
 }
 
 // Enum for API Requests, either single or batch.
@@ -150,19 +162,23 @@ impl ResponseTrackingInfo {
 }
 
 // ErrorData and ApiCallResponseData are the values stored in the cache.  It's
-// everything about a reply that isn't specific to the caller (i.e., not the 
+// everything about a reply that isn't specific to the caller (i.e., not the
 // `jsonrpc` and `id` fields)
 #[derive(Clone, Debug)]
 struct ErrorData {
     error: Value,
     http_status: StatusCode,
-    tracking_info: Option<ResponseTrackingInfo>
+    tracking_info: Option<ResponseTrackingInfo>,
+    /// Duration of the backend call in seconds (None if cached or no upstream call was made)
+    backend_duration_secs: Option<f64>
 }
 
 #[derive(Clone, Debug)]
 struct ApiCallResponseData {
     result: Value,
-    tracking_info: Option<ResponseTrackingInfo>
+    tracking_info: Option<ResponseTrackingInfo>,
+    /// Duration of the backend call in seconds (None if cached)
+    backend_duration_secs: Option<f64>
 }
 
 // The full error and response structures, including caller-specific data
@@ -291,8 +307,10 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
 }
 
 async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, request_id: &RequestId) -> CacheEntry {
-    let endpoint = match data.config.lookup_url(mapped_method.get_method_name_parts()) {
-        Some(endpoint) => { endpoint }
+    let backend_start = Instant::now();
+
+    let backend = match data.config.lookup_backend(mapped_method.get_method_name_parts()) {
+        Some(backend) => { backend }
         None => {
             return CacheEntry {
                 result: Err(ErrorData {
@@ -307,7 +325,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         mapped_method,
                         backend_url: None,
                         upstream_method: None
-                    })
+                    }),
+                    backend_duration_secs: None
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -324,13 +343,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     let tracking_info = Some(ResponseTrackingInfo {
         cached: false,
         mapped_method,
-        backend_url: Some(endpoint.to_string()),
+        backend_url: Some(backend.url.clone()),
         upstream_method: Some(upstream_request.method.clone())
     });
 
     // Send the request to the endpoints.
     let res = match client
-        .post(endpoint)
+        .post(&backend.url)
         .json(&upstream_request)
         .send()
         .await
@@ -338,8 +357,9 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Ok(response) => response,
         Err(err) => {
             let mut error_message = err.without_url().to_string();
-            error_message.push_str(&endpoint.to_string());
+            error_message.push_str(&backend.url);
             debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
+            let backend_duration_secs = backend_start.elapsed().as_secs_f64();
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -348,7 +368,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": error_message
                     }),
                     http_status: StatusCode::SERVICE_UNAVAILABLE,
-                    tracking_info
+                    tracking_info,
+                    backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -363,6 +384,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Ok(text) => text,
         Err(err) => {
             debug!(request_id=request_id.as_str(); "Received an invalid response from the endpoint: {err}");
+            let backend_duration_secs = backend_start.elapsed().as_secs_f64();
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -371,7 +393,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info
+                    tracking_info,
+                    backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -382,6 +405,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Ok(parsed) => parsed,
         Err(err) => {
             debug!(request_id=request_id.as_str(); "Unable to parse endpoint data: {err}");
+            let backend_duration_secs = backend_start.elapsed().as_secs_f64();
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
@@ -390,7 +414,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info
+                    tracking_info,
+                    backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -399,11 +424,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     };
     if json_body["error"].is_object() {
         trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", json_body["error"]);
+        let backend_duration_secs = backend_start.elapsed().as_secs_f64();
         return CacheEntry {
             result: Err(ErrorData {
                 error: json_body["error"].take(),
                 http_status: StatusCode::OK,
-                tracking_info
+                tracking_info,
+                backend_duration_secs: Some(backend_duration_secs)
             }),
             size: 0,
             ttl: CacheTtl::NoCache
@@ -430,6 +457,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
                         write_lock.head_block_time = SystemTime::from(current_head_block_time);
                     }
+                    // Update blockchain state metrics
+                    data.metrics.update_blockchain_state(new_head, new_lib);
                 }
             }
             _ => {
@@ -471,20 +500,66 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         }
     };
 
+    // Record backend duration metrics
+    let backend_duration = backend_start.elapsed().as_secs_f64();
+    data.metrics.record_backend_duration(
+        &mapped_method_ref.namespace,
+        mapped_method_ref.api.as_deref().unwrap_or(""),
+        &mapped_method_ref.method,
+        &backend.name,
+        backend_duration
+    );
+
+    let backend_duration_secs = backend_duration;
     trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result: json_body["result"].take(),
-            tracking_info
+            tracking_info,
+            backend_duration_secs: Some(backend_duration_secs)
         }),
         size: body.len() as u32,
         ttl
     }
 }
 
+/// Build a JSON access log entry for file logging
+fn build_access_log_json(
+    client_ip: &str,
+    mapped_method: &MethodAndParams,
+    duration_seconds: f64,
+    backend_time: Option<f64>,
+    cached: bool,
+    request_body_json: &str,
+    request_id: &RequestId,
+    status: u16,
+) -> Value {
+    let now = chrono::Local::now();
+    let time_local = now.format("%d/%b/%Y:%H:%M:%S %z").to_string();
+
+    json!({
+        "time_local": time_local,
+        "status": status,
+        "request": "POST / HTTP/1.1",
+        "remote_addr": client_ip,
+        "namespace": mapped_method.namespace,
+        "api": mapped_method.api.as_deref().unwrap_or(""),
+        "method": mapped_method.method,
+        "request_time": duration_seconds,
+        "backend_time": backend_time,
+        "cache_hit": cached,
+        "request_body": request_body_json,
+        "request_id": request_id.as_str()
+    })
+}
+
 async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId) -> Result<APICallResponse, ErrorStructure> {
+    let request_start = Instant::now();
+    data.metrics.inc_active_requests();
+
     // perform any requested mappings, this may give us different method names & and params
-    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| 
+    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| {
+        data.metrics.dec_active_requests();
         ErrorStructure {
             jsonrpc: request.jsonrpc.clone(),
             id : request.id.clone(),
@@ -496,15 +571,16 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             http_status: StatusCode::NOT_FOUND,
             tracking_info: None
         }
-    )?;
+    })?;
 
     check_for_future_block_requests(&mapped_method, data, request_id).await;
 
-    if log_enabled!(target: "access_log", Info) {
+    // Simple access log format (logs before request processing)
+    if data.config.drone.access_log_format == "simple" && log_enabled!(target: "access_log", Info) {
         // Get humantime for logging.
         let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
         if let Some(params) = &request.params {
-            info!(target: "access_log", 
+            info!(target: "access_log",
                   "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {} || Request Id: {}",
                   human_timestamp, client_ip, request.method, params, request_id.as_str())
         } else {
@@ -541,32 +617,148 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
                                                  async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
 
+    let duration_seconds = request_start.elapsed().as_secs_f64();
+    data.metrics.dec_active_requests();
+
+    // Serialize request body early for JSON access logging (before request is moved)
+    // Needed for both console JSON logging and file logging
+    let needs_json_logging = data.config.drone.access_log_format == "json" || data.access_log_writer.is_some();
+    let request_body_json = if needs_json_logging {
+        serde_json::to_string(&request).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     match cache_entry.result {
         Ok(api_call_response) => {
             trace!(request_id=request_id.as_str(); "Result was a regular non-error response, upstream_was_called = {upstream_was_called}");
+            let backend_duration_secs = api_call_response.backend_duration_secs;
             let mut response = APICallResponse {
                 jsonrpc: request.jsonrpc,
                 id: request.id,
                 result: api_call_response.result,
                 tracking_info: api_call_response.tracking_info
             };
+            let cached = !upstream_was_called;
             if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+                response.tracking_info.as_mut().unwrap().cached = cached;
             }
+
+            // Record success metrics
+            data.metrics.record_request_success(
+                &mapped_method.namespace,
+                mapped_method.api.as_deref().unwrap_or(""),
+                &mapped_method.method,
+                cached,
+                duration_seconds
+            );
+
+            let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
+
+            // Write to access log file if configured (always JSON format)
+            if let Some(ref writer) = data.access_log_writer {
+                let log_entry = build_access_log_json(
+                    client_ip,
+                    &mapped_method,
+                    duration_seconds,
+                    backend_time,
+                    cached,
+                    &request_body_json,
+                    request_id,
+                    200,
+                );
+                if let Ok(mut w) = writer.lock() {
+                    let _ = writeln!(w, "{}", log_entry);
+                    if data.access_log_flush_every_line {
+                        let _ = w.flush();
+                    }
+                }
+            }
+
+            // JSON access log format for console (logs after request processing with full details)
+            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
+                let log_entry = build_access_log_json(
+                    client_ip,
+                    &mapped_method,
+                    duration_seconds,
+                    backend_time,
+                    cached,
+                    &request_body_json,
+                    request_id,
+                    200,
+                );
+                info!(target: "access_log", "{}", log_entry);
+            }
+
             Ok(response)
         }
         Err(error_data) => {
             trace!(request_id=request_id.as_str(); "Result was an error response, upstream_was_called = {upstream_was_called}, http status should be {}", error_data.http_status);
+            let backend_duration_secs = error_data.backend_duration_secs;
+            let error_http_status = error_data.http_status;
             let mut response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
-                error: error_data.error,
-                http_status: error_data.http_status,
+                error: error_data.error.clone(),
+                http_status: error_http_status,
                 tracking_info: error_data.tracking_info
             };
+            let cached = !upstream_was_called;
             if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+                response.tracking_info.as_mut().unwrap().cached = cached;
             }
+
+            // Record error metrics - extract error code from JSON error object
+            let error_code = error_data.error.get("code")
+                .and_then(|c| c.as_i64())
+                .unwrap_or(-32000) as i32;
+            data.metrics.record_request_error(
+                &mapped_method.namespace,
+                mapped_method.api.as_deref().unwrap_or(""),
+                &mapped_method.method,
+                error_code,
+                cached,
+                duration_seconds
+            );
+
+            let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
+            let http_status = error_http_status.as_u16();
+
+            // Write to access log file if configured (always JSON format)
+            if let Some(ref writer) = data.access_log_writer {
+                let log_entry = build_access_log_json(
+                    client_ip,
+                    &mapped_method,
+                    duration_seconds,
+                    backend_time,
+                    cached,
+                    &request_body_json,
+                    request_id,
+                    http_status,
+                );
+                if let Ok(mut w) = writer.lock() {
+                    let _ = writeln!(w, "{}", log_entry);
+                    if data.access_log_flush_every_line {
+                        let _ = w.flush();
+                    }
+                }
+            }
+
+            // JSON access log format for console (logs after request processing with full details)
+            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
+                let log_entry = build_access_log_json(
+                    client_ip,
+                    &mapped_method,
+                    duration_seconds,
+                    backend_time,
+                    cached,
+                    &request_body_json,
+                    request_id,
+                    http_status,
+                );
+                info!(target: "access_log", "{}", log_entry);
+            }
+
             Err(response)
         }
     }
@@ -682,7 +874,10 @@ struct AppData {
     cache: Cache<String, CacheEntry>,
     webclient: Client,
     config: AppConfig,
-    blockchain_state: Arc<RwLock<BlockchainState>>
+    blockchain_state: Arc<RwLock<BlockchainState>>,
+    metrics: Arc<DroneMetrics>,
+    access_log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
+    access_log_flush_every_line: bool,
 }
 
 #[actix_web::main]
@@ -700,14 +895,68 @@ async fn main() -> std::io::Result<()> {
         value.size
     };
 
+    // Initialize metrics
+    let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
+
     // Create the cache.
-    let _cache = web::Data::new(AppData {
-        cache: Cache::builder()
-            .max_capacity(app_config.drone.cache_max_capacity)
-            .expire_after(expiry)
-            .eviction_listener(eviction_listener)
-            .weigher(weigher)
-            .build(),
+    let cache = Cache::builder()
+        .max_capacity(app_config.drone.cache_max_capacity)
+        .expire_after(expiry)
+        .eviction_listener(eviction_listener)
+        .weigher(weigher)
+        .build();
+
+    // Clone cache and metrics for background task
+    let cache_for_metrics = cache.clone();
+    let metrics_for_task = Arc::clone(&metrics);
+
+    // Spawn background task to update cache metrics every 15 seconds
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let size_bytes = cache_for_metrics.weighted_size();
+            let entry_count = cache_for_metrics.entry_count();
+            metrics_for_task.update_cache_metrics(size_bytes, entry_count);
+        }
+    });
+
+    // Initialize access log file if configured
+    // Use 32KB buffer (same as nginx default) for high-throughput scenarios
+    const ACCESS_LOG_BUFFER_SIZE: usize = 32 * 1024;
+
+    let access_log_writer = if !app_config.drone.access_log_file.is_empty() {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&app_config.drone.access_log_file)
+            .unwrap_or_else(|e| panic!("Failed to open access log file '{}': {}", app_config.drone.access_log_file, e));
+        info!("Access log file enabled: {}", app_config.drone.access_log_file);
+        Some(Arc::new(Mutex::new(BufWriter::with_capacity(ACCESS_LOG_BUFFER_SIZE, file))))
+    } else {
+        None
+    };
+
+    // Spawn background task to flush access log every 5 seconds (unless flush_every_line is enabled)
+    if let Some(ref writer) = access_log_writer {
+        if !app_config.drone.access_log_flush_every_line {
+            let writer_for_flush = Arc::clone(writer);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    if let Ok(mut w) = writer_for_flush.lock() {
+                        let _ = w.flush();
+                    }
+                }
+            });
+        }
+    }
+
+    let access_log_flush_every_line = app_config.drone.access_log_flush_every_line;
+
+    let app_data = web::Data::new(AppData {
+        cache,
         webclient: ClientBuilder::new()
             .pool_max_idle_per_host(app_config.drone.middleware_connection_threads)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -715,11 +964,22 @@ async fn main() -> std::io::Result<()> {
             .build()
             .unwrap(),
         config: app_config.clone(),
-        blockchain_state: Arc::new(RwLock::new(BlockchainState::new()))
+        blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
+        metrics,
+        access_log_writer,
+        access_log_flush_every_line,
     });
+
+    let metrics_enabled = app_config.drone.metrics_enabled;
+    let metrics_path = app_config.drone.metrics_path.clone();
+
     info!("Drone is running on port {}.", app_config.drone.port);
+    if metrics_enabled {
+        info!("Prometheus metrics enabled at {}", metrics_path);
+    }
+
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .wrap(RequestIdentifier::with_uuid().use_incoming_id(IdReuse::UseIncoming))
             .wrap(Condition::new(app_config.drone.add_cors_headers, Cors::permissive()))
             .app_data(
@@ -728,12 +988,19 @@ async fn main() -> std::io::Result<()> {
                     .content_type_required(false)
                     .limit(1024 * 100),
             ) // 100kb
-            .app_data(_cache.clone())
+            .app_data(app_data.clone())
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
             .route("/cache-entries", web::get().to(cache_entries))
-            .route("/cache-size", web::get().to(cache_size))
+            .route("/cache-size", web::get().to(cache_size));
+
+        // Add metrics endpoint if enabled
+        if metrics_enabled {
+            app = app.route(&metrics_path, web::get().to(metrics_handler));
+        }
+
+        app
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
