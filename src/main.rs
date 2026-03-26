@@ -1,3 +1,10 @@
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use moka::{future::Cache, Expiry};
@@ -175,7 +182,10 @@ struct ErrorData {
 
 #[derive(Clone, Debug)]
 struct ApiCallResponseData {
-    result: Value,
+    /// The "result" field from the upstream JSON-RPC response, stored as a raw JSON string.
+    /// This avoids the 3-4x memory overhead of serde_json::Value and makes the cache
+    /// weigher accurate (string bytes ≈ actual heap usage).
+    result_json: String,
     tracking_info: Option<ResponseTrackingInfo>,
     /// Duration of the backend call in seconds (None if cached)
     backend_duration_secs: Option<f64>
@@ -198,7 +208,8 @@ struct APICallResponse {
     /// the id the caller used in their request
     id: ID,
 
-    result: Value,
+    /// The "result" field as a raw JSON string, ready to embed directly in the response
+    result_json: String,
 
     tracking_info: Option<ResponseTrackingInfo>
 }
@@ -512,13 +523,18 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
     let backend_duration_secs = backend_duration;
     trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
+    // Store the result as a raw JSON string to avoid the 3-4x memory overhead
+    // of serde_json::Value.  All inspection of the parsed result (block number
+    // extraction, blockchain state updates) has already been done above.
+    let result_json = json_body["result"].to_string();
+    let result_json_len = result_json.len() as u32;
     CacheEntry {
         result: Ok(ApiCallResponseData {
-            result: json_body["result"].take(),
+            result_json,
             tracking_info,
             backend_duration_secs: Some(backend_duration_secs)
         }),
-        size: body.len() as u32,
+        size: result_json_len,
         ttl
     }
 }
@@ -636,7 +652,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             let mut response = APICallResponse {
                 jsonrpc: request.jsonrpc,
                 id: request.id,
-                result: api_call_response.result,
+                result_json: api_call_response.result_json,
                 tracking_info: api_call_response.tracking_info
             };
             let cached = !upstream_was_called;
@@ -803,11 +819,13 @@ async fn api_call(
                             tracking_info.into_headers(&mut reply_builder);
                         }
                     }
-                    reply_builder.json(serde_json::json!({
-                        "jsonrpc": response.jsonrpc,
-                        "result": response.result,
-                        "id": response.id,
-                    }))
+                    // Build the JSON-RPC response by embedding the raw result JSON string
+                    // directly, avoiding a parse-then-reserialize round-trip
+                    let id_json = serde_json::to_string(&response.id).unwrap();
+                    reply_builder
+                        .content_type("application/json")
+                        .body(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                            response.jsonrpc, response.result_json, id_json))
                 },
                 Err(err) => {
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
@@ -837,7 +855,7 @@ async fn api_call(
                 }));
             }
 
-            let mut responses = Vec::new();
+            let mut responses: Vec<String> = Vec::new();
             // we'll say that the result was cached if all non-error responses came from the cache.
             // the "cached" property isn't particularly useful for batch requests, so don't
             // overthink it
@@ -849,23 +867,24 @@ async fn api_call(
                         if !response.tracking_info.map_or(false, |v| v.cached) {
                             cached = false;
                         }
-                        responses.push(json!({
-                            "jsonrpc": response.jsonrpc,
-                            "result": response.result,
-                            "id": response.id,
-                        }))
+                        let id_json = serde_json::to_string(&response.id).unwrap();
+                        responses.push(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                            response.jsonrpc, response.result_json, id_json));
                     },
-                    Err(err) => responses.push(json!({
-                        "jsonrpc": err.jsonrpc,
-                        "id": err.id,
-                        "error": err.error
-                    }))
+                    Err(err) => {
+                        let id_json = serde_json::to_string(&err.id).unwrap();
+                        let error_json = serde_json::to_string(&err.error).unwrap();
+                        responses.push(format!(r#"{{"jsonrpc":"{}","id":{},"error":{}}}"#,
+                            err.jsonrpc, id_json, error_json));
+                    }
                 }
             }
+            let body = format!("[{}]", responses.join(","));
             HttpResponse::Ok()
                 .insert_header(("Drone-Version", DRONE_VERSION))
                 .insert_header(("Cache-Status", cached.to_string()))
-                .json(serde_json::Value::Array(responses))
+                .content_type("application/json")
+                .body(body)
         }
     }
 }

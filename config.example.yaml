@@ -135,7 +135,10 @@ ttls:
   appbase.condenser_api.get_block: EXPIRE_IF_REVERSIBLE
   appbase.condenser_api.get_ticker: 1
   appbase.condenser_api.get_accounts: 6
-  appbase.condenser_api.get_account_history: 6
+
+  # cache rate on get_account_history is around 17%.  Lots of unique parameter lists, large responses, probably not worth caching
+  # appbase.condenser_api.get_account_history: 6
+  appbase.condenser_api.get_account_history: NO_CACHE
   appbase.condenser_api.get_content: 6
   appbase.condenser_api.get_profile: 6
   appbase.database_api.find_accounts: 3
