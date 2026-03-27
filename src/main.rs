@@ -5,12 +5,19 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// Configure jemalloc: enable background thread for page purging, reduce dirty/muzzy
+// page decay from 10s to 1s so freed memory is returned to the OS faster.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::fs::{File, OpenOptions};
@@ -214,6 +221,17 @@ struct APICallResponse {
     tracking_info: Option<ResponseTrackingInfo>
 }
 
+/// Targeted deserialization of upstream JSON-RPC responses.  The "result" field
+/// is kept as an unparsed raw JSON string (via RawValue), avoiding the 3-4x memory
+/// overhead of building a full serde_json::Value tree for every response.
+/// Only the ~1% of requests that need deep inspection (get_dynamic_global_properties,
+/// EXPIRE_IF_REVERSIBLE) will subsequently parse the result.
+#[derive(Deserialize)]
+struct UpstreamJsonRpcResponse {
+    result: Option<Box<RawValue>>,
+    error: Option<Value>,
+}
+
 #[derive(Debug, Copy, Clone)]
 enum CacheTtl {
     NoCache,
@@ -412,7 +430,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             };
         }
     };
-    let mut json_body: serde_json::Value = match serde_json::from_str(&body) {
+    // Deserialize using RawValue for the "result" field — this avoids building a full
+    // serde_json::Value tree (3-4x memory overhead) for every upstream response.
+    // Only the ~1% of requests needing deep inspection will parse the result later.
+    let upstream_resp: UpstreamJsonRpcResponse = match serde_json::from_str(&body) {
         Ok(parsed) => parsed,
         Err(err) => {
             debug!(request_id=request_id.as_str(); "Unable to parse endpoint data: {err}");
@@ -433,76 +454,101 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             };
         }
     };
-    if json_body["error"].is_object() {
-        trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", json_body["error"]);
-        let backend_duration_secs = backend_start.elapsed().as_secs_f64();
-        return CacheEntry {
-            result: Err(ErrorData {
-                error: json_body["error"].take(),
-                http_status: StatusCode::OK,
-                tracking_info,
-                backend_duration_secs: Some(backend_duration_secs)
-            }),
-            size: 0,
-            ttl: CacheTtl::NoCache
-        };
+
+    // Check for error response
+    if let Some(ref error) = upstream_resp.error {
+        if error.is_object() {
+            trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", error);
+            let backend_duration_secs = backend_start.elapsed().as_secs_f64();
+            return CacheEntry {
+                result: Err(ErrorData {
+                    error: upstream_resp.error.unwrap(),
+                    http_status: StatusCode::OK,
+                    tracking_info,
+                    backend_duration_secs: Some(backend_duration_secs)
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
+        }
     }
 
-    // if the call was to get_dynamic_global_properties, save off the last irreversible block
+    // Get the raw result JSON string (zero-copy borrow from `body` via RawValue)
+    let result_json_str = match upstream_resp.result {
+        Some(ref raw) => raw.get(),
+        None => "null",
+    };
+
     let mapped_method_ref = &tracking_info.as_ref().unwrap().mapped_method;
     let method_name_only = &mapped_method_ref.method;
     debug!(request_id=request_id.as_str(); "Mapped method is {}", method_name_only);
+
+    // Check for empty/null results that shouldn't be cached (using string comparison
+    // instead of parsing into a Value)
+    let is_empty_result = result_json_str == "null"
+        || result_json_str == "[]"
+        || result_json_str.starts_with("{\"blocks\":[]");
+
+    // Look up TTL config first, so we know whether we need to parse the result
+    let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+    debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
+
+    // Only parse the result into a Value for the few methods that need deep inspection:
+    // - get_dynamic_global_properties: extract blockchain state (LIB, head block, time)
+    // - EXPIRE_IF_REVERSIBLE methods: extract block number from result
+    // This avoids building the full Value tree for ~99% of requests.
+    let needs_parsed_result = method_name_only == "get_dynamic_global_properties"
+        || ttl_from_config == TtlValue::ExpireIfReversible;
+
+    let parsed_result: Option<Value> = if needs_parsed_result {
+        serde_json::from_str(result_json_str).ok()
+    } else {
+        None
+    };
+
+    // Update blockchain state from get_dynamic_global_properties
     if method_name_only == "get_dynamic_global_properties" {
-        let new_lib = json_body["result"]["last_irreversible_block_num"].as_u64().map(|v| v as u32);
-        let new_head = json_body["result"]["head_block_number"].as_u64().map(|v| v as u32);
-        let new_time = json_body["result"]["time"].as_str();
-        match (new_lib, new_head, new_time) {
-            (Some(new_lib), Some(new_head), Some(new_time)) => {
-                let read_lock = data.blockchain_state.read().await;
-                if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
-                    drop(read_lock);
-                    let mut write_lock = data.blockchain_state.write().await;
-                    write_lock.last_irreversible_block_number = new_lib;
-                    if new_head != write_lock.head_block_number {
-                        write_lock.head_block_number = new_head;
-                        let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
-                        write_lock.head_block_time = SystemTime::from(current_head_block_time);
+        if let Some(ref result_value) = parsed_result {
+            let new_lib = result_value["last_irreversible_block_num"].as_u64().map(|v| v as u32);
+            let new_head = result_value["head_block_number"].as_u64().map(|v| v as u32);
+            let new_time = result_value["time"].as_str();
+            match (new_lib, new_head, new_time) {
+                (Some(new_lib), Some(new_head), Some(new_time)) => {
+                    let read_lock = data.blockchain_state.read().await;
+                    if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
+                        drop(read_lock);
+                        let mut write_lock = data.blockchain_state.write().await;
+                        write_lock.last_irreversible_block_number = new_lib;
+                        if new_head != write_lock.head_block_number {
+                            write_lock.head_block_number = new_head;
+                            let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
+                            write_lock.head_block_time = SystemTime::from(current_head_block_time);
+                        }
+                        // Update blockchain state metrics
+                        data.metrics.update_blockchain_state(new_head, new_lib);
                     }
-                    // Update blockchain state metrics
-                    data.metrics.update_blockchain_state(new_head, new_lib);
                 }
-            }
-            _ => {
-                warn!(request_id=request_id.as_str(); "Invalid get_dynamic_global_properties result, ignoring");
+                _ => {
+                    warn!(request_id=request_id.as_str(); "Invalid get_dynamic_global_properties result, ignoring");
+                }
             }
         }
     }
 
-    let ttl = if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-                 || json_body["result"].is_null()
-                 || json_body["result"]["blocks"].is_array() && json_body["result"]["blocks"].as_array().unwrap().is_empty()
-    {
-        // then this result shouldn't be cached
-        // TODO: why?
+    // Determine TTL
+    let ttl = if is_empty_result {
         CacheTtl::NoCache
-    }
-    else
-    {
-        let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
-        debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
-
+    } else {
         match ttl_from_config {
             TtlValue::NoCache => { CacheTtl::NoCache }
             TtlValue::NoExpire => { CacheTtl::NoExpire }
             TtlValue::ExpireIfReversible => {
                 // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-                if let Some(block_number) = get_block_number_from_result(&json_body["result"], request_id) {
+                let block_number = parsed_result.as_ref().and_then(|v| get_block_number_from_result(v, request_id));
+                if let Some(block_number) = block_number {
                     let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
                     if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
                 } else {
-                    // we couldn't extract a block number from the result.  probably an error
-                    // result, or the config has specified ExpireIfReversible for a call that isn't
-                    // supported by get_block_number_from_result
                     CacheTtl::NoCache
                 }
             }
@@ -510,6 +556,18 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             TtlValue::DurationInSeconds(seconds) => { CacheTtl::CacheForDuration(Duration::from_secs(seconds as u64)) }
         }
     };
+
+    // Own the result string before dropping the upstream response.
+    // result_json_str borrows from upstream_resp via RawValue, so we must
+    // copy it before we can free the response body.
+    let result_json = result_json_str.to_owned();
+    let result_json_len = result_json.len() as u32;
+
+    // Drop temporaries: parsed Value (if any), upstream response (contains RawValue
+    // borrowing from body), and then the body itself.
+    drop(parsed_result);
+    drop(upstream_resp);
+    drop(body);
 
     // Record backend duration metrics
     let backend_duration = backend_start.elapsed().as_secs_f64();
@@ -523,11 +581,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
     let backend_duration_secs = backend_duration;
     trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
-    // Store the result as a raw JSON string to avoid the 3-4x memory overhead
-    // of serde_json::Value.  All inspection of the parsed result (block number
-    // extraction, blockchain state updates) has already been done above.
-    let result_json = json_body["result"].to_string();
-    let result_json_len = result_json.len() as u32;
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result_json,
