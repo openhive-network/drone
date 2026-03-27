@@ -697,6 +697,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha256",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
 ]
@@ -2045,6 +2046,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.49",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

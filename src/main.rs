@@ -10,7 +10,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:21\0";
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
@@ -98,6 +98,78 @@ async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4; charset=utf-8")
         .body(metrics_text)
+}
+
+/// Returns jemalloc internal memory counters.  Zero overhead — reads cached stats.
+/// Key insight: if allocated grows linearly, it's a leak.  If allocated is stable
+/// but resident grows, it's fragmentation.
+#[cfg(not(target_env = "msvc"))]
+async fn jemalloc_stats_handler() -> impl Responder {
+    tikv_jemalloc_ctl::epoch::advance().unwrap();
+
+    let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0);
+    let active = tikv_jemalloc_ctl::stats::active::read().unwrap_or(0);
+    let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
+    let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
+    let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
+
+    HttpResponse::Ok().json(json!({
+        "allocated_bytes": allocated,
+        "active_bytes": active,
+        "resident_bytes": resident,
+        "mapped_bytes": mapped,
+        "retained_bytes": retained,
+        "allocated_mb": allocated / (1024 * 1024),
+        "active_mb": active / (1024 * 1024),
+        "resident_mb": resident / (1024 * 1024),
+        "mapped_mb": mapped / (1024 * 1024),
+        "retained_mb": retained / (1024 * 1024),
+        "fragmentation_bytes": resident.saturating_sub(allocated),
+        "fragmentation_pct": if allocated > 0 { ((resident.saturating_sub(allocated)) as f64 / allocated as f64) * 100.0 } else { 0.0 }
+    }))
+}
+
+/// Triggers a jemalloc heap profile dump and returns the raw .heap file.
+/// Profiling starts disabled; first call activates it.  ~4.5% overhead when active.
+/// Analyze with: jeprof --text /path/to/drone dump.heap
+#[cfg(not(target_env = "msvc"))]
+async fn heap_profile_handler() -> impl Responder {
+    use std::ffi::CString;
+
+    // Activate profiling if not already active
+    let currently_active: bool = unsafe { tikv_jemalloc_ctl::raw::read(b"prof.active\0") }.unwrap_or(false);
+    if !currently_active {
+        if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) } {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": format!("Failed to activate profiling: {}", e)}));
+        }
+        info!("jemalloc heap profiling activated");
+    }
+
+    // Dump profile to temp file
+    let path = format!("/tmp/drone_heap_{}.heap", std::process::id());
+    let path_cstr = match CString::new(path.clone()) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Invalid path: {}", e)})),
+    };
+    if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", path_cstr.as_ptr()) } {
+        return HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Failed to dump profile: {}", e)}));
+    }
+
+    // Read and return the file
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let _ = std::fs::remove_file(&path);
+            HttpResponse::Ok()
+                .content_type("application/octet-stream")
+                .insert_header(("Content-Disposition", "attachment; filename=heap.prof"))
+                .body(data)
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Failed to read profile dump: {}", e)}))
+    }
 }
 
 // Enum for API Requests, either single or batch.
@@ -1070,6 +1142,13 @@ async fn main() -> std::io::Result<()> {
         // Add metrics endpoint if enabled
         if metrics_enabled {
             app = app.route(&metrics_path, web::get().to(metrics_handler));
+        }
+
+        // jemalloc debug endpoints (always available, zero overhead for stats)
+        #[cfg(not(target_env = "msvc"))]
+        {
+            app = app.route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler));
+            app = app.route("/debug/heap_profile", web::get().to(heap_profile_handler));
         }
 
         app
