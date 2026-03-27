@@ -14,7 +14,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
-use moka::{future::Cache, Expiry};
+use quick_cache::sync::Cache as QuickCache;
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json, value::RawValue};
@@ -78,14 +78,12 @@ async fn index(appdata: web::Data<AppData>) -> impl Responder {
 }
 
 async fn cache_size(appdata: web::Data<AppData>) -> impl Responder {
-    let cache = appdata.cache.read().unwrap().clone();
-    HttpResponse::Ok().json(json!({"current_size": cache.weighted_size(), "max_size": appdata.config.drone.cache_max_capacity}))
+    HttpResponse::Ok().json(json!({"current_size": appdata.cache.weight(), "max_size": appdata.config.drone.cache_max_capacity}))
 }
 
 // return a list of cache keys and their sizes.  Can be huge
 async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
-    let cache = appdata.cache.read().unwrap().clone();
-    let entries: Vec<Value> = cache.iter().map(|(key, value)| {
+    let entries: Vec<Value> = appdata.cache.iter().map(|(key, value)| {
         json!({
             "key": (*key).to_string(),
             "size": value.size
@@ -319,48 +317,26 @@ enum CacheTtl {
 struct CacheEntry {
     result: Result<ApiCallResponseData, ErrorData>,
     size: u32,
-	ttl: CacheTtl,
+    ttl: CacheTtl,
+    inserted_at: Instant,
 }
 
-pub struct MyExpiry;
-
-impl MyExpiry {
-    fn get_expiration(&self, key: &String, value: &CacheEntry) -> Option<Duration> {
-		match value.ttl {
-            CacheTtl::NoExpire => { 
-                trace!("get_expiration called with key {key}, returning duration None (never expire).");
-                None
-            }
-            CacheTtl::NoCache => {
-                trace!("get_expiration called with key {key}, returning duration 0 (don't cache).");
-                Some(Duration::ZERO)
-            }
-            CacheTtl::CacheForDuration(duration) => {
-                trace!("get_expiration called with key {key}, returning duration {:?}", duration);
-                Some(duration)
-            }
+impl CacheEntry {
+    fn is_expired(&self) -> bool {
+        match self.ttl {
+            CacheTtl::NoCache => true,
+            CacheTtl::NoExpire => false,
+            CacheTtl::CacheForDuration(duration) => self.inserted_at.elapsed() > duration,
         }
     }
 }
 
-impl Expiry<String, CacheEntry> for MyExpiry {
-    /// Returns the duration of the expiration of the value that was just
-    /// created.
-    fn expire_after_create(&self, key: &String, value: &CacheEntry, _current_time: Instant) -> Option<Duration> {
-        self.get_expiration(key, value)
-    }
-    /// We never explicitly update cache entries, we keep serving data from the cache until the
-    /// cache entry expires, then when we get a cache miss we make another call to the upstream and
-    /// insert the new value.
-    /// But it appears that there's some lazyness -- after an entry's expiration time has passed,
-    /// get() calls will return None, but the entry will still exist in the cache for a while until
-    /// the entry is actually evicted, maybe on the order of ~0.3s.  If we insert a new value
-    /// during that window, I think it considers that an "update" and not a "create", so we need to
-    /// override expire_after_update too.
-    fn expire_after_update(&self, key: &String, value: &CacheEntry, 
-                           _updated_at: Instant,
-                           _duration_until_expiry: Option<Duration>) -> Option<Duration> {
-        self.get_expiration(key, value)
+#[derive(Clone)]
+struct CacheWeighter;
+
+impl quick_cache::Weighter<String, CacheEntry> for CacheWeighter {
+    fn weight(&self, _key: &String, value: &CacheEntry) -> u64 {
+        value.size as u64
     }
 }
 
@@ -428,7 +404,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     backend_duration_secs: None
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
+                inserted_at: Instant::now(),
             };
         }
     };
@@ -463,7 +440,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
+                inserted_at: Instant::now(),
             };
         }
     };
@@ -487,7 +465,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
+                inserted_at: Instant::now(),
             };
         }
     };
@@ -510,7 +489,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
+                inserted_at: Instant::now(),
             };
         }
     };
@@ -527,7 +507,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
+                inserted_at: Instant::now(),
             };
         }
     }
@@ -645,7 +626,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             backend_duration_secs: Some(backend_duration_secs)
         }),
         size: result_json_len,
-        ttl
+        ttl,
+        inserted_at: Instant::now(),
     }
 }
 
@@ -716,33 +698,45 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         }
     }
 
-    // Get the result of the call.  The get_with() call below will:
-    // - see if the result of the call is cached.  If so, return the result immediately
-    // - if not, it checks whether some other task is currently calling the upstream to
-    //   get the result of this same call.  If so, it will just share their result instead
-    //   of initiating a second call
-    // - otherwise, it will call the closure (request_from_upstream()) to get the result,
-    //   then insert it into the cache
+    // Cache lookup with request deduplication via quick_cache's guard API.
+    // get_value_or_guard_async returns either:
+    //   Ok(entry) — cache hit (or another task already computing this key, shared result)
+    //   Err(guard) — cache miss, we hold the guard, other callers for the same key wait on us
     //
-    // notes: 
-    // - moka is in charge of this behavior, and it behaves the way we want, but that means
-    //   we have less information about exactly what happened when we call get_with().  
-    //   We say that the result is "cached" if the closure didn't get executed; that could
-    //   mean that the result was already in the cache, or it could mean that another task/thread
-    //   was already in the process of requesting it.  That means times for some "cached" calls
-    //   could be as long as non-cached calls.  Just something to be aware of.
-    // - to get this "combining multiple simultaneous calls" behavior, we're inserting every
-    //   result into the cache, even if it's marked as something we don't want to cache in the
-    //   config (we just insert them with a TTL of zero).  That may cause some 
-    //   unnecessary/unwanted effects, but so far performance seems to be the same compared to
-    //   an alternate implementation where the caching and combining were handled separately.
+    // TTL is checked manually: quick_cache doesn't have built-in per-entry TTL, so expired
+    // entries are treated as misses and removed.  NoCache entries are never inserted.
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
     let mut upstream_was_called = false;
-    let cache = data.cache.read().unwrap().clone();
-    let cache_entry = cache.get_with_by_ref(&method_and_params_str,
-                                            async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
+    let cache_entry = match data.cache.get_value_or_guard_async(&method_and_params_str).await {
+        Ok(entry) if !entry.is_expired() => {
+            // Valid cache hit
+            entry
+        }
+        Ok(_expired) => {
+            // Expired entry — remove and fetch fresh
+            data.cache.remove(&method_and_params_str);
+            upstream_was_called = true;
+            let entry = request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await;
+            if !matches!(entry.ttl, CacheTtl::NoCache) {
+                data.cache.insert(method_and_params_str.clone(), entry.clone());
+            }
+            entry
+        }
+        Err(guard) => {
+            // Cache miss — we hold the guard, others wait on us
+            upstream_was_called = true;
+            let entry = request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await;
+            if matches!(entry.ttl, CacheTtl::NoCache) {
+                // Don't cache — drop guard so waiters retry with their own upstream call
+                drop(guard);
+            } else {
+                let _ = guard.insert(entry.clone());
+            }
+            entry
+        }
+    };
 
     let duration_seconds = request_start.elapsed().as_secs_f64();
     data.metrics.dec_active_requests();
@@ -1004,7 +998,7 @@ async fn api_call(
 }
 
 struct AppData {
-    cache: Arc<std::sync::RwLock<Cache<String, CacheEntry>>>,
+    cache: QuickCache<String, CacheEntry, CacheWeighter>,
     webclient: Client,
     config: AppConfig,
     blockchain_state: Arc<RwLock<BlockchainState>>,
@@ -1019,80 +1013,15 @@ async fn main() -> std::io::Result<()> {
     // Load config.
     let app_config = config::parse_file("config.yaml");
 
-    // helpers for the cach
-    let expiry = MyExpiry;
-    let eviction_listener = |key, _value, cause| {
-        debug!("Evicted key {key}. Cause: {cause:?}");
-    };
-    let weigher = |_key: &String, value: &CacheEntry| -> u32 {
-        value.size
-    };
-
     // Initialize metrics
     let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
 
-    // Create the cache.
-    let cache = Cache::builder()
-        .max_capacity(app_config.drone.cache_max_capacity)
-        .expire_after(expiry)
-        .eviction_listener(eviction_listener)
-        .weigher(weigher)
-        .build();
-
-    // Wrap cache in RwLock so a background task can periodically recreate it
-    // to reclaim crossbeam-epoch garbage from moka's concurrent hash table.
-    // moka::Cache::clone() is just Arc::clone, so read-path overhead is negligible.
-    let cache = std::sync::RwLock::new(cache);
-    let cache = Arc::new(cache);
-
-    // Clone cache and metrics for background tasks
-    let cache_for_metrics = Arc::clone(&cache);
-    let metrics_for_task = Arc::clone(&metrics);
-
-    // Spawn background task to update cache metrics every 15 seconds
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        loop {
-            interval.tick().await;
-            let c = cache_for_metrics.read().unwrap().clone();
-            let size_bytes = c.weighted_size();
-            let entry_count = c.entry_count();
-            metrics_for_task.update_cache_metrics(size_bytes, entry_count);
-        }
-    });
-
-    // Spawn background task to periodically recreate the cache.
-    // moka's concurrent hash table (CHT) uses crossbeam-epoch for garbage collection
-    // of old bucket arrays, but under sustained high throughput (~46K req/min) the GC
-    // can't keep pace, causing ~100 MB/min of unreclaimable memory growth.
-    // Dropping and recreating the cache forces crossbeam-epoch to flush its buffers.
-    let cache_for_recreate = Arc::clone(&cache);
-    let cache_max_capacity = app_config.drone.cache_max_capacity;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(4 * 3600)); // every 4 hours
-        interval.tick().await; // skip the first immediate tick
-        loop {
-            interval.tick().await;
-            info!("Recreating cache to reclaim moka/crossbeam-epoch garbage");
-            let new_cache = Cache::builder()
-                .max_capacity(cache_max_capacity)
-                .expire_after(MyExpiry)
-                .eviction_listener(|key, _value, cause| {
-                    debug!("Evicted key {key}. Cause: {cause:?}");
-                })
-                .weigher(|_key: &String, value: &CacheEntry| -> u32 {
-                    value.size
-                })
-                .build();
-            let old_cache = {
-                let mut lock = cache_for_recreate.write().unwrap();
-                std::mem::replace(&mut *lock, new_cache)
-            };
-            // Drop the old cache outside the lock — this triggers crossbeam-epoch flush
-            drop(old_cache);
-            info!("Cache recreated successfully");
-        }
-    });
+    // Create the cache using quick_cache (no crossbeam-epoch, no unbounded memory growth)
+    let cache = QuickCache::with_weighter(
+        100_000, // estimated items capacity
+        app_config.drone.cache_max_capacity,
+        CacheWeighter,
+    );
 
     // Initialize access log file if configured
     // Use 32KB buffer (same as nginx default) for high-throughput scenarios
@@ -1141,6 +1070,18 @@ async fn main() -> std::io::Result<()> {
         metrics,
         access_log_writer,
         access_log_flush_every_line,
+    });
+
+    // Spawn background task to update cache metrics every 15 seconds
+    let app_data_for_metrics = app_data.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let size_bytes = app_data_for_metrics.cache.weight();
+            let entry_count = app_data_for_metrics.cache.len() as u64;
+            app_data_for_metrics.metrics.update_cache_metrics(size_bytes, entry_count);
+        }
     });
 
     let metrics_enabled = app_config.drone.metrics_enabled;
