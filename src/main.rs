@@ -78,12 +78,14 @@ async fn index(appdata: web::Data<AppData>) -> impl Responder {
 }
 
 async fn cache_size(appdata: web::Data<AppData>) -> impl Responder {
-    HttpResponse::Ok().json(json!({"current_size": appdata.cache.weighted_size(), "max_size": appdata.config.drone.cache_max_capacity}))
+    let cache = appdata.cache.read().unwrap().clone();
+    HttpResponse::Ok().json(json!({"current_size": cache.weighted_size(), "max_size": appdata.config.drone.cache_max_capacity}))
 }
 
 // return a list of cache keys and their sizes.  Can be huge
 async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
-    let entries: Vec<Value> = appdata.cache.iter().map(|(key, value)| {
+    let cache = appdata.cache.read().unwrap().clone();
+    let entries: Vec<Value> = cache.iter().map(|(key, value)| {
         json!({
             "key": (*key).to_string(),
             "size": value.size
@@ -249,12 +251,15 @@ impl ResponseTrackingInfo {
 
 // ErrorData and ApiCallResponseData are the values stored in the cache.  It's
 // everything about a reply that isn't specific to the caller (i.e., not the
-// `jsonrpc` and `id` fields)
+// `jsonrpc` and `id` fields).
+// NOTE: tracking_info is deliberately NOT stored here — it contains MethodAndParams
+// with a serde_json::Value (request params) that causes unbounded memory growth when
+// cloned inside moka's concurrent hash map (crossbeam-epoch GC can't reclaim fast enough).
+// Instead, tracking_info is reconstructed from the mapped_method in handle_request().
 #[derive(Clone, Debug)]
 struct ErrorData {
     error: Value,
     http_status: StatusCode,
-    tracking_info: Option<ResponseTrackingInfo>,
     /// Duration of the backend call in seconds (None if cached or no upstream call was made)
     backend_duration_secs: Option<f64>
 }
@@ -265,7 +270,6 @@ struct ApiCallResponseData {
     /// This avoids the 3-4x memory overhead of serde_json::Value and makes the cache
     /// weigher accurate (string bytes ≈ actual heap usage).
     result_json: String,
-    tracking_info: Option<ResponseTrackingInfo>,
     /// Duration of the backend call in seconds (None if cached)
     backend_duration_secs: Option<f64>
 }
@@ -421,12 +425,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": "Unable to map request to endpoint."
                     }),
                     http_status: StatusCode::NOT_FOUND,
-                    tracking_info: Some(ResponseTrackingInfo {
-                        cached: false,
-                        mapped_method,
-                        backend_url: None,
-                        upstream_method: None
-                    }),
                     backend_duration_secs: None
                 }),
                 size: 0,
@@ -440,13 +438,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
-
-    let tracking_info = Some(ResponseTrackingInfo {
-        cached: false,
-        mapped_method,
-        backend_url: Some(backend.url.clone()),
-        upstream_method: Some(upstream_request.method.clone())
-    });
 
     // Send the request to the endpoints.
     let res = match client
@@ -469,7 +460,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": error_message
                     }),
                     http_status: StatusCode::SERVICE_UNAVAILABLE,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -494,7 +484,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -518,7 +507,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -536,7 +524,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 result: Err(ErrorData {
                     error: upstream_resp.error.unwrap(),
                     http_status: StatusCode::OK,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -551,8 +538,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         None => "null",
     };
 
-    let mapped_method_ref = &tracking_info.as_ref().unwrap().mapped_method;
-    let method_name_only = &mapped_method_ref.method;
+    let method_name_only = &mapped_method.method;
     debug!(request_id=request_id.as_str(); "Mapped method is {}", method_name_only);
 
     // Check for empty/null results that shouldn't be cached (using string comparison
@@ -562,7 +548,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         || result_json_str.starts_with("{\"blocks\":[]");
 
     // Look up TTL config first, so we know whether we need to parse the result
-    let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+    let ttl_from_config = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
     debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
 
     // Only parse the result into a Value for the few methods that need deep inspection:
@@ -644,9 +630,9 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // Record backend duration metrics
     let backend_duration = backend_start.elapsed().as_secs_f64();
     data.metrics.record_backend_duration(
-        &mapped_method_ref.namespace,
-        mapped_method_ref.api.as_deref().unwrap_or(""),
-        &mapped_method_ref.method,
+        &mapped_method.namespace,
+        mapped_method.api.as_deref().unwrap_or(""),
+        &mapped_method.method,
         &backend.name,
         backend_duration
     );
@@ -656,7 +642,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result_json,
-            tracking_info,
             backend_duration_secs: Some(backend_duration_secs)
         }),
         size: result_json_len,
@@ -755,8 +740,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
     let mut upstream_was_called = false;
-    let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
-                                                 async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
+    let cache = data.cache.read().unwrap().clone();
+    let cache_entry = cache.get_with_by_ref(&method_and_params_str,
+                                            async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
 
     let duration_seconds = request_start.elapsed().as_secs_f64();
     data.metrics.dec_active_requests();
@@ -774,18 +760,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         Ok(api_call_response) => {
             trace!(request_id=request_id.as_str(); "Result was a regular non-error response, upstream_was_called = {upstream_was_called}");
             let backend_duration_secs = api_call_response.backend_duration_secs;
-            let mut response = APICallResponse {
-                jsonrpc: request.jsonrpc,
-                id: request.id,
-                result_json: api_call_response.result_json,
-                tracking_info: api_call_response.tracking_info
-            };
             let cached = !upstream_was_called;
-            if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = cached;
-            }
 
-            // Record success metrics
+            // Record success metrics (before moving mapped_method into tracking_info)
             data.metrics.record_request_success(
                 &mapped_method.namespace,
                 mapped_method.api.as_deref().unwrap_or(""),
@@ -831,23 +808,29 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 info!(target: "access_log", "{}", log_entry);
             }
 
-            Ok(response)
+            // Construct tracking_info here (not in cache) to avoid cloning
+            // MethodAndParams with its Value params inside moka's concurrent hash map
+            let backend = data.config.lookup_backend(mapped_method.get_method_name_parts());
+            let upstream_method = mapped_method.format_for_upstream(&data.config).method;
+            let tracking_info = ResponseTrackingInfo {
+                cached,
+                mapped_method,
+                backend_url: backend.map(|b| b.url.clone()),
+                upstream_method: Some(upstream_method),
+            };
+
+            Ok(APICallResponse {
+                jsonrpc: request.jsonrpc,
+                id: request.id,
+                result_json: api_call_response.result_json,
+                tracking_info: Some(tracking_info),
+            })
         }
         Err(error_data) => {
             trace!(request_id=request_id.as_str(); "Result was an error response, upstream_was_called = {upstream_was_called}, http status should be {}", error_data.http_status);
             let backend_duration_secs = error_data.backend_duration_secs;
             let error_http_status = error_data.http_status;
-            let mut response = ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id,
-                error: error_data.error.clone(),
-                http_status: error_http_status,
-                tracking_info: error_data.tracking_info
-            };
             let cached = !upstream_was_called;
-            if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = cached;
-            }
 
             // Record error metrics - extract error code from JSON error object
             let error_code = error_data.error.get("code")
@@ -900,7 +883,13 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 info!(target: "access_log", "{}", log_entry);
             }
 
-            Err(response)
+            Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id: request.id,
+                error: error_data.error.clone(),
+                http_status: error_http_status,
+                tracking_info: None, // not worth reconstructing for error responses
+            })
         }
     }
 }
@@ -1015,7 +1004,7 @@ async fn api_call(
 }
 
 struct AppData {
-    cache: Cache<String, CacheEntry>,
+    cache: Arc<std::sync::RwLock<Cache<String, CacheEntry>>>,
     webclient: Client,
     config: AppConfig,
     blockchain_state: Arc<RwLock<BlockchainState>>,
@@ -1050,8 +1039,14 @@ async fn main() -> std::io::Result<()> {
         .weigher(weigher)
         .build();
 
-    // Clone cache and metrics for background task
-    let cache_for_metrics = cache.clone();
+    // Wrap cache in RwLock so a background task can periodically recreate it
+    // to reclaim crossbeam-epoch garbage from moka's concurrent hash table.
+    // moka::Cache::clone() is just Arc::clone, so read-path overhead is negligible.
+    let cache = std::sync::RwLock::new(cache);
+    let cache = Arc::new(cache);
+
+    // Clone cache and metrics for background tasks
+    let cache_for_metrics = Arc::clone(&cache);
     let metrics_for_task = Arc::clone(&metrics);
 
     // Spawn background task to update cache metrics every 15 seconds
@@ -1059,9 +1054,43 @@ async fn main() -> std::io::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             interval.tick().await;
-            let size_bytes = cache_for_metrics.weighted_size();
-            let entry_count = cache_for_metrics.entry_count();
+            let c = cache_for_metrics.read().unwrap().clone();
+            let size_bytes = c.weighted_size();
+            let entry_count = c.entry_count();
             metrics_for_task.update_cache_metrics(size_bytes, entry_count);
+        }
+    });
+
+    // Spawn background task to periodically recreate the cache.
+    // moka's concurrent hash table (CHT) uses crossbeam-epoch for garbage collection
+    // of old bucket arrays, but under sustained high throughput (~46K req/min) the GC
+    // can't keep pace, causing ~100 MB/min of unreclaimable memory growth.
+    // Dropping and recreating the cache forces crossbeam-epoch to flush its buffers.
+    let cache_for_recreate = Arc::clone(&cache);
+    let cache_max_capacity = app_config.drone.cache_max_capacity;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(4 * 3600)); // every 4 hours
+        interval.tick().await; // skip the first immediate tick
+        loop {
+            interval.tick().await;
+            info!("Recreating cache to reclaim moka/crossbeam-epoch garbage");
+            let new_cache = Cache::builder()
+                .max_capacity(cache_max_capacity)
+                .expire_after(MyExpiry)
+                .eviction_listener(|key, _value, cause| {
+                    debug!("Evicted key {key}. Cause: {cause:?}");
+                })
+                .weigher(|_key: &String, value: &CacheEntry| -> u32 {
+                    value.size
+                })
+                .build();
+            let old_cache = {
+                let mut lock = cache_for_recreate.write().unwrap();
+                std::mem::replace(&mut *lock, new_cache)
+            };
+            // Drop the old cache outside the lock — this triggers crossbeam-epoch flush
+            drop(old_cache);
+            info!("Cache recreated successfully");
         }
     });
 
@@ -1144,9 +1173,9 @@ async fn main() -> std::io::Result<()> {
             app = app.route(&metrics_path, web::get().to(metrics_handler));
         }
 
-        // jemalloc debug endpoints (always available, zero overhead for stats)
+        // jemalloc debug endpoints (disabled by default, enable with debug_endpoints_enabled: true)
         #[cfg(not(target_env = "msvc"))]
-        {
+        if app_config.drone.debug_endpoints_enabled {
             app = app.route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler));
             app = app.route("/debug/heap_profile", web::get().to(heap_profile_handler));
         }

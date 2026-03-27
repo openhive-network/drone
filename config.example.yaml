@@ -23,6 +23,9 @@ drone:
   metrics_enabled: true        # Enable/disable the /metrics endpoint
   metrics_path: "/metrics"     # Path for Prometheus scraping
   metrics_namespace: "drone"   # Prefix for all metric names (e.g., drone_requests_total)
+  # Debug endpoints for memory profiling (/debug/jemalloc_stats, /debug/heap_profile)
+  # Disabled by default — enable only during investigation, heap_profile has ~4.5% overhead when active
+  debug_endpoints_enabled: false
 # The remainder of this file is based on the information in existing jussi config files,
 # just in a more concise yaml format.
 
