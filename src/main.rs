@@ -15,7 +15,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use quick_cache::sync::Cache as QuickCache;
-use reqwest::{Client, ClientBuilder};
+use ureq::Agent;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json, value::RawValue};
 use std::sync::{Arc, Mutex};
@@ -412,22 +412,26 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
     let upstream_request = mapped_method.format_for_upstream(&data.config);
     debug!(request_id=request_id.as_str(); "Making upstream request for {method_and_params_str}");
-    // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
-    let client = data.webclient.clone();
+    // Use ureq (blocking HTTP client) via spawn_blocking to avoid hyper's per-connection
+    // tokio task leak.  ureq uses std::net::TcpStream directly — when the request completes,
+    // all buffers are freed immediately with no async task lifecycle issues.
+    let agent = data.webclient.clone();
+    let backend_url = backend.url.clone();
+    let request_json = serde_json::to_string(&upstream_request).unwrap();
 
-    // Send the request to the endpoints.
-    let res = match client
-        .post(&backend.url)
-        .json(&upstream_request)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let mut error_message = err.without_url().to_string();
-            error_message.push_str(&backend.url);
-            debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
+    let body = match tokio::task::spawn_blocking(move || -> Result<String, String> {
+        agent.post(&backend_url)
+            .set("Content-Type", "application/json")
+            .send_string(&request_json)
+            .map_err(|e| e.to_string())?
+            .into_string()
+            .map_err(|e| e.to_string())
+    }).await {
+        Ok(Ok(text)) => text,
+        Ok(Err(err)) => {
+            let error_message = format!("{err} {}", backend.url);
+            debug!(request_id=request_id.as_str(); "Error making upstream request: {error_message}");
             let backend_duration_secs = backend_start.elapsed().as_secs_f64();
             return CacheEntry {
                 result: Err(ErrorData {
@@ -444,22 +448,15 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 inserted_at: Instant::now(),
             };
         }
-    };
-
-    // to simulate slow calls, put a sleep here
-    // sleep(Duration::from_secs(10)).await;
-
-    let body = match res.text().await {
-        Ok(text) => text,
-        Err(err) => {
-            debug!(request_id=request_id.as_str(); "Received an invalid response from the endpoint: {err}");
+        Err(join_err) => {
+            error!(request_id=request_id.as_str(); "spawn_blocking panicked: {join_err}");
             let backend_duration_secs = backend_start.elapsed().as_secs_f64();
             return CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
-                        "code": -32600,
-                        "message": "Received an invalid response from the endpoint.",
-                        "error": err.to_string(),
+                        "code": -32700,
+                        "message": "Internal error during upstream request.",
+                        "error": join_err.to_string()
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
                     backend_duration_secs: Some(backend_duration_secs)
@@ -999,7 +996,7 @@ async fn api_call(
 
 struct AppData {
     cache: QuickCache<String, CacheEntry, CacheWeighter>,
-    webclient: Client,
+    webclient: Agent,
     config: AppConfig,
     blockchain_state: Arc<RwLock<BlockchainState>>,
     metrics: Arc<DroneMetrics>,
@@ -1059,12 +1056,10 @@ async fn main() -> std::io::Result<()> {
 
     let app_data = web::Data::new(AppData {
         cache,
-        webclient: ClientBuilder::new()
-            .pool_max_idle_per_host(app_config.drone.middleware_connection_threads)
-            .pool_idle_timeout(Duration::from_secs(90))
+        webclient: ureq::AgentBuilder::new()
+            .max_idle_connections_per_host(app_config.drone.middleware_connection_threads)
             .timeout(Duration::from_secs(90))
-            .build()
-            .unwrap(),
+            .build(),
         config: app_config.clone(),
         blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
         metrics,
