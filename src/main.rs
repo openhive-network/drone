@@ -896,8 +896,21 @@ fn should_close_connection(req: &HttpRequest, max_lifetime: Duration) -> bool {
     if max_lifetime.is_zero() {
         return false;
     }
-    req.conn_data::<ConnBirthTime>()
-        .map_or(false, |birth| birth.0.elapsed() > max_lifetime)
+    match req.conn_data::<ConnBirthTime>() {
+        Some(birth) => {
+            let age = birth.0.elapsed();
+            if age > max_lifetime {
+                debug!("Connection age {:?} exceeds max lifetime {:?}, sending Connection: close", age, max_lifetime);
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            warn!("conn_data::<ConnBirthTime>() returned None — on_connect may not be working");
+            false
+        }
+    }
 }
 
 async fn api_call(
