@@ -78,6 +78,12 @@ pub struct DroneConfig {
     /// whether to enable debug endpoints (/debug/jemalloc_stats, /debug/heap_profile)
     #[serde(default)]
     pub debug_endpoints_enabled: bool,
+
+    /// Maximum connection lifetime in seconds (0 = unlimited).  After this many seconds,
+    /// responses include "Connection: close" to force the client to reconnect.  This works
+    /// around actix-http's BytesMut buffers growing monotonically on long-lived connections.
+    #[serde(default)]
+    pub max_conn_lifetime_secs: u64,
 }
 
 
@@ -168,7 +174,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false, max_conn_lifetime_secs: 0},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),

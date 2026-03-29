@@ -13,7 +13,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:21\0";
 
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition, dev::Extensions};
 use quick_cache::sync::Cache as QuickCache;
 use ureq::Agent;
 use serde::{Deserialize, Serialize, Serializer};
@@ -42,6 +42,11 @@ pub mod metrics;
 use metrics::DroneMetrics;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Stored as connection-level extension data via HttpServer::on_connect.
+/// Used to track connection age and force recycling when max_conn_lifetime_secs is set.
+#[derive(Clone)]
+struct ConnBirthTime(Instant);
 
 
 struct BlockchainState {
@@ -885,6 +890,16 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     }
 }
 
+/// Check if the connection has exceeded its max lifetime and should be closed.
+/// Returns true if we should add "Connection: close" to the response.
+fn should_close_connection(req: &HttpRequest, max_lifetime: Duration) -> bool {
+    if max_lifetime.is_zero() {
+        return false;
+    }
+    req.conn_data::<ConnBirthTime>()
+        .map_or(false, |birth| birth.0.elapsed() > max_lifetime)
+}
+
 async fn api_call(
     req: HttpRequest,
     call: web::Json<APICall>,
@@ -912,6 +927,10 @@ async fn api_call(
         }
     };
 
+    // Force connection close if it has exceeded its max lifetime.  This recycles
+    // actix-http's internal BytesMut buffers which grow monotonically on long-lived connections.
+    let close_conn = should_close_connection(&req, Duration::from_secs(data.config.drone.max_conn_lifetime_secs));
+
     match call.0 {
         APICall::Single(request) => {
             let result = handle_request(request, &data, &user_ip, &request_id).await;
@@ -919,6 +938,9 @@ async fn api_call(
                 Ok(response) => {
                     let mut reply_builder = HttpResponse::Ok();
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if close_conn {
+                        reply_builder.insert_header(("Connection", "close"));
+                    }
                     if data.config.drone.add_jussi_headers {
                         if let Some(tracking_info) = response.tracking_info {
                             tracking_info.into_headers(&mut reply_builder);
@@ -936,6 +958,9 @@ async fn api_call(
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
                     let mut reply_builder = HttpResponse::build(err.http_status);
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if close_conn {
+                        reply_builder.insert_header(("Connection", "close"));
+                    }
                     if let Some(tracking_info) = err.tracking_info {
                         tracking_info.into_headers(&mut reply_builder);
                     }
@@ -985,9 +1010,13 @@ async fn api_call(
                 }
             }
             let body = format!("[{}]", responses.join(","));
-            HttpResponse::Ok()
-                .insert_header(("Drone-Version", DRONE_VERSION))
-                .insert_header(("Cache-Status", cached.to_string()))
+            let mut reply_builder = HttpResponse::Ok();
+            reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+            reply_builder.insert_header(("Cache-Status", cached.to_string()));
+            if close_conn {
+                reply_builder.insert_header(("Connection", "close"));
+            }
+            reply_builder
                 .content_type("application/json")
                 .body(body)
         }
@@ -1117,6 +1146,9 @@ async fn main() -> std::io::Result<()> {
         }
 
         app
+    })
+    .on_connect(|_conn, ext: &mut Extensions| {
+        ext.insert(ConnBirthTime(Instant::now()));
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
