@@ -952,7 +952,7 @@ async fn api_call(
                     let mut reply_builder = HttpResponse::Ok();
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
                     if close_conn {
-                        reply_builder.insert_header(("Connection", "close"));
+                        reply_builder.force_close();
                     }
                     if data.config.drone.add_jussi_headers {
                         if let Some(tracking_info) = response.tracking_info {
@@ -972,7 +972,7 @@ async fn api_call(
                     let mut reply_builder = HttpResponse::build(err.http_status);
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
                     if close_conn {
-                        reply_builder.insert_header(("Connection", "close"));
+                        reply_builder.force_close();
                     }
                     if let Some(tracking_info) = err.tracking_info {
                         tracking_info.into_headers(&mut reply_builder);
@@ -1027,7 +1027,7 @@ async fn api_call(
             reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
             reply_builder.insert_header(("Cache-Status", cached.to_string()));
             if close_conn {
-                reply_builder.insert_header(("Connection", "close"));
+                reply_builder.force_close();
             }
             reply_builder
                 .content_type("application/json")
