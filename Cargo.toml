@@ -28,6 +28,10 @@ sha256 = "1.5.0"
 prometheus = "0.13"
 lazy_static = "1.4"
 
+[features]
+default = []
+jemalloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["profiling"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }

@@ -1,13 +1,13 @@
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 use tikv_jemallocator::Jemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
 // Configure jemalloc: enable background thread for page purging, reduce dirty/muzzy
 // page decay from 10s to 1s so freed memory is returned to the OS faster.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:21\0";
@@ -108,7 +108,7 @@ async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
 /// Returns jemalloc internal memory counters.  Zero overhead — reads cached stats.
 /// Key insight: if allocated grows linearly, it's a leak.  If allocated is stable
 /// but resident grows, it's fragmentation.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 async fn jemalloc_stats_handler() -> impl Responder {
     tikv_jemalloc_ctl::epoch::advance().unwrap();
 
@@ -137,7 +137,7 @@ async fn jemalloc_stats_handler() -> impl Responder {
 /// Triggers a jemalloc heap profile dump and returns the raw .heap file.
 /// Profiling starts disabled; first call activates it.  ~4.5% overhead when active.
 /// Analyze with: jeprof --text /path/to/drone dump.heap
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 async fn heap_profile_handler() -> impl Responder {
     use std::ffi::CString;
 
@@ -1152,7 +1152,7 @@ async fn main() -> std::io::Result<()> {
         }
 
         // jemalloc debug endpoints (disabled by default, enable with debug_endpoints_enabled: true)
-        #[cfg(not(target_env = "msvc"))]
+        #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
         if app_config.drone.debug_endpoints_enabled {
             app = app.route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler));
             app = app.route("/debug/heap_profile", web::get().to(heap_profile_handler));
