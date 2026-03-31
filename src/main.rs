@@ -1,5 +1,5 @@
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition, dev::Extensions};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
@@ -24,6 +24,10 @@ use method_renamer::MethodAndParams;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Per-connection request counter, set via HttpServer::on_connect.
+/// Used to force connection recycling after N requests, preventing
+/// actix-http's BytesMut buffers from growing indefinitely.
+struct ConnRequestCount(std::sync::atomic::AtomicU32);
 
 struct BlockchainState {
     last_irreversible_block_number: u32,
@@ -572,6 +576,19 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     }
 }
 
+/// Increment per-connection request counter, return true when limit is reached.
+fn should_close_connection(req: &HttpRequest, max_requests: u32) -> bool {
+    if max_requests == 0 {
+        return false;
+    }
+    match req.conn_data::<ConnRequestCount>() {
+        Some(counter) => {
+            counter.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 >= max_requests
+        }
+        None => false,
+    }
+}
+
 async fn api_call(
     req: HttpRequest,
     call: web::Json<APICall>,
@@ -599,6 +616,9 @@ async fn api_call(
         }
     };
 
+    // Force connection close after N requests to recycle actix-http's BytesMut buffers
+    let close_conn = should_close_connection(&req, data.config.drone.max_conn_lifetime_secs);
+
     match call.0 {
         APICall::Single(request) => {
             let result = handle_request(request, &data, &user_ip, &request_id).await;
@@ -606,6 +626,9 @@ async fn api_call(
                 Ok(response) => {
                     let mut reply_builder = HttpResponse::Ok();
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if close_conn {
+                        reply_builder.force_close();
+                    }
                     if data.config.drone.add_jussi_headers {
                         if let Some(tracking_info) = response.tracking_info {
                             tracking_info.into_headers(&mut reply_builder);
@@ -621,6 +644,9 @@ async fn api_call(
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
                     let mut reply_builder = HttpResponse::build(err.http_status);
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if close_conn {
+                        reply_builder.force_close();
+                    }
                     if let Some(tracking_info) = err.tracking_info {
                         tracking_info.into_headers(&mut reply_builder);
                     }
@@ -670,10 +696,13 @@ async fn api_call(
                     }))
                 }
             }
-            HttpResponse::Ok()
-                .insert_header(("Drone-Version", DRONE_VERSION))
-                .insert_header(("Cache-Status", cached.to_string()))
-                .json(serde_json::Value::Array(responses))
+            let mut reply_builder = HttpResponse::Ok();
+            reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+            reply_builder.insert_header(("Cache-Status", cached.to_string()));
+            if close_conn {
+                reply_builder.force_close();
+            }
+            reply_builder.json(serde_json::Value::Array(responses))
         }
     }
 }
@@ -734,6 +763,9 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(index))
             .route("/cache-entries", web::get().to(cache_entries))
             .route("/cache-size", web::get().to(cache_size))
+    })
+    .on_connect(|_conn, ext: &mut Extensions| {
+        ext.insert(ConnRequestCount(std::sync::atomic::AtomicU32::new(0)));
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()

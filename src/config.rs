@@ -46,6 +46,13 @@ pub struct DroneConfig {
     /// whether to add jussi debugging headers for analysis scripts to parse
     #[serde(default)]
     pub add_jussi_headers: bool,
+
+    /// Maximum requests per connection before forcing close (0 = unlimited).
+    /// After this many requests, drone closes the connection, recycling
+    /// actix-http's internal BytesMut buffers that grow monotonically.
+    /// Recommended: 100.
+    #[serde(default)]
+    pub max_conn_lifetime_secs: u32,
 }
 
 
@@ -129,7 +136,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, max_conn_lifetime_secs: 0},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),
