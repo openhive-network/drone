@@ -79,11 +79,12 @@ pub struct DroneConfig {
     #[serde(default)]
     pub debug_endpoints_enabled: bool,
 
-    /// Maximum connection lifetime in seconds (0 = unlimited).  After this many seconds,
-    /// responses include "Connection: close" to force the client to reconnect.  This works
-    /// around actix-http's BytesMut buffers growing monotonically on long-lived connections.
+    /// Maximum requests per connection before forcing close (0 = unlimited).
+    /// After this many requests, drone sends force_close() to recycle the connection,
+    /// freeing actix-http's BytesMut buffers that grow monotonically.
+    /// Recommended: 100 (~7 seconds at typical load).
     #[serde(default)]
-    pub max_conn_lifetime_secs: u64,
+    pub max_conn_lifetime_secs: u32,
 }
 
 

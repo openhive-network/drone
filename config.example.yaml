@@ -26,11 +26,11 @@ drone:
   # Debug endpoints for memory profiling (/debug/jemalloc_stats, /debug/heap_profile)
   # Disabled by default — enable only during investigation, heap_profile has ~4.5% overhead when active
   debug_endpoints_enabled: false
-  # Maximum connection lifetime in seconds (0 = unlimited, default).
-  # After this many seconds, Drone sends "Connection: close" to force clients to
-  # reconnect, which recycles actix-http's internal buffers that grow over time.
-  # Recommended: 300 (5 minutes) for long-running production deployments.
-  max_conn_lifetime_secs: 300
+  # Maximum requests per connection before forcing close (0 = unlimited, default).
+  # After this many requests, Drone closes the connection, recycling actix-http's
+  # internal BytesMut buffers that grow monotonically over a connection's lifetime.
+  # Recommended: 100 (connections recycle every ~7 seconds at typical load).
+  max_conn_lifetime_secs: 100
 # The remainder of this file is based on the information in existing jussi config files,
 # just in a more concise yaml format.
 

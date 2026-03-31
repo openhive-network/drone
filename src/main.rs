@@ -44,9 +44,9 @@ use metrics::DroneMetrics;
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Stored as connection-level extension data via HttpServer::on_connect.
-/// Used to track connection age and force recycling when max_conn_lifetime_secs is set.
-#[derive(Clone)]
-struct ConnBirthTime(Instant);
+/// Tracks request count per connection to force recycling after N requests,
+/// preventing actix-http's BytesMut buffers from growing indefinitely.
+struct ConnRequestCount(std::sync::atomic::AtomicU32);
 
 
 struct BlockchainState {
@@ -890,24 +890,19 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     }
 }
 
-/// Check if the connection has exceeded its max lifetime and should be closed.
-/// Returns true if we should add "Connection: close" to the response.
-fn should_close_connection(req: &HttpRequest, max_lifetime: Duration) -> bool {
-    if max_lifetime.is_zero() {
+/// Check if the connection has exceeded its max request count and should be closed.
+/// Increments the per-connection counter and returns true when the limit is reached.
+fn should_close_connection(req: &HttpRequest, max_requests: u32) -> bool {
+    if max_requests == 0 {
         return false;
     }
-    match req.conn_data::<ConnBirthTime>() {
-        Some(birth) => {
-            let age = birth.0.elapsed();
-            if age > max_lifetime {
-                debug!("Connection age {:?} exceeds max lifetime {:?}, sending Connection: close", age, max_lifetime);
-                true
-            } else {
-                false
-            }
+    match req.conn_data::<ConnRequestCount>() {
+        Some(counter) => {
+            let count = counter.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            count >= max_requests
         }
         None => {
-            warn!("conn_data::<ConnBirthTime>() returned None — on_connect may not be working");
+            warn!("conn_data::<ConnRequestCount>() returned None — on_connect may not be working");
             false
         }
     }
@@ -942,7 +937,7 @@ async fn api_call(
 
     // Force connection close if it has exceeded its max lifetime.  This recycles
     // actix-http's internal BytesMut buffers which grow monotonically on long-lived connections.
-    let close_conn = should_close_connection(&req, Duration::from_secs(data.config.drone.max_conn_lifetime_secs));
+    let close_conn = should_close_connection(&req, data.config.drone.max_conn_lifetime_secs);
 
     match call.0 {
         APICall::Single(request) => {
@@ -1161,7 +1156,7 @@ async fn main() -> std::io::Result<()> {
         app
     })
     .on_connect(|_conn, ext: &mut Extensions| {
-        ext.insert(ConnBirthTime(Instant::now()));
+        ext.insert(ConnRequestCount(std::sync::atomic::AtomicU32::new(0)));
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
