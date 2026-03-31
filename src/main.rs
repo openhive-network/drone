@@ -1,10 +1,3 @@
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use moka::{future::Cache, Expiry};
@@ -79,25 +72,6 @@ async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
     }).collect();
 
     HttpResponse::Ok().json(entries)
-}
-
-#[cfg(not(target_env = "msvc"))]
-async fn jemalloc_stats_handler() -> impl Responder {
-    tikv_jemalloc_ctl::epoch::advance().unwrap();
-    let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0);
-    let active = tikv_jemalloc_ctl::stats::active::read().unwrap_or(0);
-    let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
-    let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
-    let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
-    HttpResponse::Ok().json(json!({
-        "allocated_bytes": allocated, "active_bytes": active, "resident_bytes": resident,
-        "mapped_bytes": mapped, "retained_bytes": retained,
-        "allocated_mb": allocated / (1024 * 1024), "active_mb": active / (1024 * 1024),
-        "resident_mb": resident / (1024 * 1024), "mapped_mb": mapped / (1024 * 1024),
-        "retained_mb": retained / (1024 * 1024),
-        "fragmentation_bytes": resident.saturating_sub(allocated),
-        "fragmentation_pct": if allocated > 0 { ((resident.saturating_sub(allocated)) as f64 / allocated as f64) * 100.0 } else { 0.0 }
-    }))
 }
 
 // Enum for API Requests, either single or batch.
@@ -760,7 +734,6 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(index))
             .route("/cache-entries", web::get().to(cache_entries))
             .route("/cache-size", web::get().to(cache_size))
-            .route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler))
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
