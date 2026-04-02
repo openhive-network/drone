@@ -1,9 +1,21 @@
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:21\0";
+
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::fs::{File, OpenOptions};
@@ -84,6 +96,59 @@ async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4; charset=utf-8")
         .body(metrics_text)
+}
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+async fn jemalloc_stats_handler() -> impl Responder {
+    tikv_jemalloc_ctl::epoch::advance().unwrap();
+    let allocated = tikv_jemalloc_ctl::stats::allocated::read().unwrap_or(0);
+    let active = tikv_jemalloc_ctl::stats::active::read().unwrap_or(0);
+    let resident = tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0);
+    let mapped = tikv_jemalloc_ctl::stats::mapped::read().unwrap_or(0);
+    let retained = tikv_jemalloc_ctl::stats::retained::read().unwrap_or(0);
+    HttpResponse::Ok().json(json!({
+        "allocated_bytes": allocated, "active_bytes": active, "resident_bytes": resident,
+        "mapped_bytes": mapped, "retained_bytes": retained,
+        "allocated_mb": allocated / (1024 * 1024), "active_mb": active / (1024 * 1024),
+        "resident_mb": resident / (1024 * 1024), "mapped_mb": mapped / (1024 * 1024),
+        "retained_mb": retained / (1024 * 1024),
+        "fragmentation_bytes": resident.saturating_sub(allocated),
+        "fragmentation_pct": if allocated > 0 { ((resident.saturating_sub(allocated)) as f64 / allocated as f64) * 100.0 } else { 0.0 }
+    }))
+}
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+async fn heap_profile_handler() -> impl Responder {
+    use std::ffi::CString;
+    let currently_active: bool = unsafe { tikv_jemalloc_ctl::raw::read(b"prof.active\0") }.unwrap_or(false);
+    if !currently_active {
+        if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) } {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": format!("Failed to activate profiling: {}", e)}));
+        }
+        info!("jemalloc heap profiling activated");
+    }
+    let path = format!("/tmp/drone_heap_{}.heap", std::process::id());
+    let path_cstr = match CString::new(path.clone()) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Invalid path: {}", e)})),
+    };
+    if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", path_cstr.as_ptr()) } {
+        return HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Failed to dump profile: {}", e)}));
+    }
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let _ = std::fs::remove_file(&path);
+            HttpResponse::Ok()
+                .content_type("application/octet-stream")
+                .insert_header(("Content-Disposition", "attachment; filename=heap.prof"))
+                .body(data)
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .json(json!({"error": format!("Failed to read profile dump: {}", e)}))
+    }
 }
 
 // Enum for API Requests, either single or batch.
@@ -168,15 +233,13 @@ impl ResponseTrackingInfo {
 struct ErrorData {
     error: Value,
     http_status: StatusCode,
-    tracking_info: Option<ResponseTrackingInfo>,
     /// Duration of the backend call in seconds (None if cached or no upstream call was made)
     backend_duration_secs: Option<f64>
 }
 
 #[derive(Clone, Debug)]
 struct ApiCallResponseData {
-    result: Value,
-    tracking_info: Option<ResponseTrackingInfo>,
+    result_json: String,
     /// Duration of the backend call in seconds (None if cached)
     backend_duration_secs: Option<f64>
 }
@@ -198,9 +261,18 @@ struct APICallResponse {
     /// the id the caller used in their request
     id: ID,
 
-    result: Value,
+    result_json: String,
 
     tracking_info: Option<ResponseTrackingInfo>
+}
+
+/// Targeted deserialization of upstream JSON-RPC responses. The "result" field
+/// is kept as an unparsed raw JSON string (via RawValue), avoiding the 3-4x memory
+/// overhead of building a full serde_json::Value tree for every response.
+#[derive(Deserialize)]
+struct UpstreamJsonRpcResponse {
+    result: Option<Box<RawValue>>,
+    error: Option<Value>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -320,12 +392,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": "Unable to map request to endpoint."
                     }),
                     http_status: StatusCode::NOT_FOUND,
-                    tracking_info: Some(ResponseTrackingInfo {
-                        cached: false,
-                        mapped_method,
-                        backend_url: None,
-                        upstream_method: None
-                    }),
                     backend_duration_secs: None
                 }),
                 size: 0,
@@ -339,13 +405,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
-
-    let tracking_info = Some(ResponseTrackingInfo {
-        cached: false,
-        mapped_method,
-        backend_url: Some(backend.url.clone()),
-        upstream_method: Some(upstream_request.method.clone())
-    });
 
     // Send the request to the endpoints.
     let res = match client
@@ -368,7 +427,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": error_message
                     }),
                     http_status: StatusCode::SERVICE_UNAVAILABLE,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -393,7 +451,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -401,7 +458,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             };
         }
     };
-    let mut json_body: serde_json::Value = match serde_json::from_str(&body) {
+    let upstream_resp: UpstreamJsonRpcResponse = match serde_json::from_str(&body) {
         Ok(parsed) => parsed,
         Err(err) => {
             debug!(request_id=request_id.as_str(); "Unable to parse endpoint data: {err}");
@@ -414,7 +471,6 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    tracking_info,
                     backend_duration_secs: Some(backend_duration_secs)
                 }),
                 size: 0,
@@ -422,70 +478,93 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             };
         }
     };
-    if json_body["error"].is_object() {
-        trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", json_body["error"]);
-        let backend_duration_secs = backend_start.elapsed().as_secs_f64();
-        return CacheEntry {
-            result: Err(ErrorData {
-                error: json_body["error"].take(),
-                http_status: StatusCode::OK,
-                tracking_info,
-                backend_duration_secs: Some(backend_duration_secs)
-            }),
-            size: 0,
-            ttl: CacheTtl::NoCache
-        };
+
+    // Check for error response
+    if let Some(ref error) = upstream_resp.error {
+        if error.is_object() {
+            trace!(request_id=request_id.as_str(); "Upstream response was an error: {}", error);
+            let backend_duration_secs = backend_start.elapsed().as_secs_f64();
+            return CacheEntry {
+                result: Err(ErrorData {
+                    error: error.clone(),
+                    http_status: StatusCode::OK,
+                    backend_duration_secs: Some(backend_duration_secs)
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
+        }
     }
 
+    // Get raw result string
+    let result_json_str = match upstream_resp.result {
+        Some(ref raw) => raw.get(),
+        None => "null",
+    };
+
     // if the call was to get_dynamic_global_properties, save off the last irreversible block
-    let mapped_method_ref = &tracking_info.as_ref().unwrap().mapped_method;
-    let method_name_only = &mapped_method_ref.method;
+    let method_name_only = &mapped_method.method;
     debug!(request_id=request_id.as_str(); "Mapped method is {}", method_name_only);
+
+    // Check for empty results using string comparisons (avoids full parse)
+    let is_empty_result = result_json_str == "null"
+        || result_json_str == "[]"
+        || result_json_str.starts_with("{\"blocks\":[]");
+
+    // Look up TTL from config
+    let ttl_from_config = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+    debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
+
+    // Only parse the result JSON for methods that actually need it
+    let needs_parsed_result = method_name_only == "get_dynamic_global_properties"
+        || ttl_from_config == TtlValue::ExpireIfReversible;
+
+    let parsed_result: Option<Value> = if needs_parsed_result {
+        serde_json::from_str(result_json_str).ok()
+    } else {
+        None
+    };
+
     if method_name_only == "get_dynamic_global_properties" {
-        let new_lib = json_body["result"]["last_irreversible_block_num"].as_u64().map(|v| v as u32);
-        let new_head = json_body["result"]["head_block_number"].as_u64().map(|v| v as u32);
-        let new_time = json_body["result"]["time"].as_str();
-        match (new_lib, new_head, new_time) {
-            (Some(new_lib), Some(new_head), Some(new_time)) => {
-                let read_lock = data.blockchain_state.read().await;
-                if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
-                    drop(read_lock);
-                    let mut write_lock = data.blockchain_state.write().await;
-                    write_lock.last_irreversible_block_number = new_lib;
-                    if new_head != write_lock.head_block_number {
-                        write_lock.head_block_number = new_head;
-                        let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
-                        write_lock.head_block_time = SystemTime::from(current_head_block_time);
+        if let Some(ref result_val) = parsed_result {
+            let new_lib = result_val["last_irreversible_block_num"].as_u64().map(|v| v as u32);
+            let new_head = result_val["head_block_number"].as_u64().map(|v| v as u32);
+            let new_time = result_val["time"].as_str();
+            match (new_lib, new_head, new_time) {
+                (Some(new_lib), Some(new_head), Some(new_time)) => {
+                    let read_lock = data.blockchain_state.read().await;
+                    if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
+                        drop(read_lock);
+                        let mut write_lock = data.blockchain_state.write().await;
+                        write_lock.last_irreversible_block_number = new_lib;
+                        if new_head != write_lock.head_block_number {
+                            write_lock.head_block_number = new_head;
+                            let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
+                            write_lock.head_block_time = SystemTime::from(current_head_block_time);
+                        }
+                        // Update blockchain state metrics
+                        data.metrics.update_blockchain_state(new_head, new_lib);
                     }
-                    // Update blockchain state metrics
-                    data.metrics.update_blockchain_state(new_head, new_lib);
                 }
-            }
-            _ => {
-                warn!(request_id=request_id.as_str(); "Invalid get_dynamic_global_properties result, ignoring");
+                _ => {
+                    warn!(request_id=request_id.as_str(); "Invalid get_dynamic_global_properties result, ignoring");
+                }
             }
         }
     }
 
-    let ttl = if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-                 || json_body["result"].is_null()
-                 || json_body["result"]["blocks"].is_array() && json_body["result"]["blocks"].as_array().unwrap().is_empty()
-    {
-        // then this result shouldn't be cached
-        // TODO: why?
+    let ttl = if is_empty_result {
+        // empty results shouldn't be cached
         CacheTtl::NoCache
     }
     else
     {
-        let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
-        debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
-
         match ttl_from_config {
             TtlValue::NoCache => { CacheTtl::NoCache }
             TtlValue::NoExpire => { CacheTtl::NoExpire }
             TtlValue::ExpireIfReversible => {
                 // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-                if let Some(block_number) = get_block_number_from_result(&json_body["result"], request_id) {
+                if let Some(block_number) = parsed_result.as_ref().and_then(|v| get_block_number_from_result(v, request_id)) {
                     let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
                     if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
                 } else {
@@ -503,22 +582,28 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // Record backend duration metrics
     let backend_duration = backend_start.elapsed().as_secs_f64();
     data.metrics.record_backend_duration(
-        &mapped_method_ref.namespace,
-        mapped_method_ref.api.as_deref().unwrap_or(""),
-        &mapped_method_ref.method,
+        &mapped_method.namespace,
+        mapped_method.api.as_deref().unwrap_or(""),
+        &mapped_method.method,
         &backend.name,
         backend_duration
     );
 
     let backend_duration_secs = backend_duration;
     trace!(request_id=request_id.as_str(); "Upstream call succeeded, returning cache entry with ttl {:?}", ttl);
+
+    let result_json = result_json_str.to_owned();
+    let result_json_len = result_json.len() as u32;
+    drop(parsed_result);
+    drop(upstream_resp);
+    drop(body);
+
     CacheEntry {
         result: Ok(ApiCallResponseData {
-            result: json_body["result"].take(),
-            tracking_info,
+            result_json,
             backend_duration_secs: Some(backend_duration_secs)
         }),
-        size: body.len() as u32,
+        size: result_json_len,
         ttl
     }
 }
@@ -633,16 +718,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         Ok(api_call_response) => {
             trace!(request_id=request_id.as_str(); "Result was a regular non-error response, upstream_was_called = {upstream_was_called}");
             let backend_duration_secs = api_call_response.backend_duration_secs;
-            let mut response = APICallResponse {
-                jsonrpc: request.jsonrpc,
-                id: request.id,
-                result: api_call_response.result,
-                tracking_info: api_call_response.tracking_info
-            };
             let cached = !upstream_was_called;
-            if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = cached;
-            }
 
             // Record success metrics
             data.metrics.record_request_success(
@@ -690,23 +766,35 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 info!(target: "access_log", "{}", log_entry);
             }
 
-            Ok(response)
+            // Construct tracking_info from mapped_method (not from cache entry)
+            let backend = data.config.lookup_backend(mapped_method.get_method_name_parts());
+            let upstream_method = mapped_method.format_for_upstream(&data.config).method;
+            let tracking_info = ResponseTrackingInfo {
+                cached,
+                mapped_method,
+                backend_url: backend.map(|b| b.url.clone()),
+                upstream_method: Some(upstream_method),
+            };
+
+            Ok(APICallResponse {
+                jsonrpc: request.jsonrpc,
+                id: request.id,
+                result_json: api_call_response.result_json,
+                tracking_info: Some(tracking_info),
+            })
         }
         Err(error_data) => {
             trace!(request_id=request_id.as_str(); "Result was an error response, upstream_was_called = {upstream_was_called}, http status should be {}", error_data.http_status);
             let backend_duration_secs = error_data.backend_duration_secs;
             let error_http_status = error_data.http_status;
-            let mut response = ErrorStructure {
+            let response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
                 error: error_data.error.clone(),
                 http_status: error_http_status,
-                tracking_info: error_data.tracking_info
+                tracking_info: None
             };
             let cached = !upstream_was_called;
-            if response.tracking_info.is_some() {
-                response.tracking_info.as_mut().unwrap().cached = cached;
-            }
 
             // Record error metrics - extract error code from JSON error object
             let error_code = error_data.error.get("code")
@@ -803,11 +891,11 @@ async fn api_call(
                             tracking_info.into_headers(&mut reply_builder);
                         }
                     }
-                    reply_builder.json(serde_json::json!({
-                        "jsonrpc": response.jsonrpc,
-                        "result": response.result,
-                        "id": response.id,
-                    }))
+                    let id_json = serde_json::to_string(&response.id).unwrap();
+                    reply_builder
+                        .content_type("application/json")
+                        .body(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                            response.jsonrpc, response.result_json, id_json))
                 },
                 Err(err) => {
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
@@ -837,7 +925,7 @@ async fn api_call(
                 }));
             }
 
-            let mut responses = Vec::new();
+            let mut responses: Vec<String> = Vec::new();
             // we'll say that the result was cached if all non-error responses came from the cache.
             // the "cached" property isn't particularly useful for batch requests, so don't
             // overthink it
@@ -849,23 +937,24 @@ async fn api_call(
                         if !response.tracking_info.map_or(false, |v| v.cached) {
                             cached = false;
                         }
-                        responses.push(json!({
-                            "jsonrpc": response.jsonrpc,
-                            "result": response.result,
-                            "id": response.id,
-                        }))
+                        let id_json = serde_json::to_string(&response.id).unwrap();
+                        responses.push(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                            response.jsonrpc, response.result_json, id_json));
                     },
-                    Err(err) => responses.push(json!({
-                        "jsonrpc": err.jsonrpc,
-                        "id": err.id,
-                        "error": err.error
-                    }))
+                    Err(err) => {
+                        let id_json = serde_json::to_string(&err.id).unwrap();
+                        let error_json = serde_json::to_string(&err.error).unwrap();
+                        responses.push(format!(r#"{{"jsonrpc":"{}","id":{},"error":{}}}"#,
+                            err.jsonrpc, id_json, error_json));
+                    }
                 }
             }
+            let body = format!("[{}]", responses.join(","));
             HttpResponse::Ok()
                 .insert_header(("Drone-Version", DRONE_VERSION))
                 .insert_header(("Cache-Status", cached.to_string()))
-                .json(serde_json::Value::Array(responses))
+                .content_type("application/json")
+                .body(body)
         }
     }
 }
@@ -972,6 +1061,8 @@ async fn main() -> std::io::Result<()> {
 
     let metrics_enabled = app_config.drone.metrics_enabled;
     let metrics_path = app_config.drone.metrics_path.clone();
+    #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+    let debug_endpoints_enabled = app_config.drone.debug_endpoints_enabled;
 
     info!("Drone is running on port {}.", app_config.drone.port);
     if metrics_enabled {
@@ -998,6 +1089,12 @@ async fn main() -> std::io::Result<()> {
         // Add metrics endpoint if enabled
         if metrics_enabled {
             app = app.route(&metrics_path, web::get().to(metrics_handler));
+        }
+
+        #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+        if debug_endpoints_enabled {
+            app = app.route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler));
+            app = app.route("/debug/heap_profile", web::get().to(heap_profile_handler));
         }
 
         app
