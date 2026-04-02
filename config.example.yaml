@@ -23,6 +23,7 @@ drone:
   metrics_enabled: true        # Enable/disable the /metrics endpoint
   metrics_path: "/metrics"     # Path for Prometheus scraping
   metrics_namespace: "drone"   # Prefix for all metric names (e.g., drone_requests_total)
+  debug_endpoints_enabled: false  # Enable /debug/jemalloc_stats and /debug/heap_profile (requires jemalloc feature)
 # The remainder of this file is based on the information in existing jussi config files,
 # just in a more concise yaml format.
 
@@ -135,7 +136,7 @@ ttls:
   appbase.condenser_api.get_block: EXPIRE_IF_REVERSIBLE
   appbase.condenser_api.get_ticker: 1
   appbase.condenser_api.get_accounts: 6
-  appbase.condenser_api.get_account_history: 6
+  appbase.condenser_api.get_account_history: NO_CACHE  # ~17% hit rate, not worth caching
   appbase.condenser_api.get_content: 6
   appbase.condenser_api.get_profile: 6
   appbase.database_api.find_accounts: 3
