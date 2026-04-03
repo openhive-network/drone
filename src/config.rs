@@ -158,13 +158,46 @@ struct YamlConfig {
     equivalent_methods: HashMap<String, Vec<String>>,
 }
 
+/// Deep-merge two YAML values.  Fields in `override_val` take precedence.
+/// For mappings, keys are merged recursively.  For all other types, the override replaces the base.
+fn deep_merge(base: &mut serde_yaml::Value, override_val: serde_yaml::Value) {
+    match (base, override_val) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(override_map)) => {
+            for (key, override_v) in override_map {
+                if let Some(base_v) = base_map.get_mut(&key) {
+                    deep_merge(base_v, override_v);
+                } else {
+                    base_map.insert(key, override_v);
+                }
+            }
+        }
+        (base, override_val) => {
+            *base = override_val;
+        }
+    }
+}
+
 pub fn parse_file(filename: &str) -> AppConfig {
-    // Parse the YAML into a temporary structure
+    // Parse the base YAML config
     let yaml_string = fs::read_to_string(filename)
         .expect("Unable to read file");
 
-    let config: YamlConfig = serde_yaml::from_str(&yaml_string)
+    let mut yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_string)
         .expect("Unable to parse YAML");
+
+    // If a local override file exists, deep-merge it on top of the base config.
+    // This allows operators to keep deployment-specific settings (metrics, logging, etc.)
+    // in a separate file that won't conflict with upstream updates to config.yaml.
+    let local_filename = filename.replace(".yaml", ".local.yaml");
+    if let Ok(local_yaml_string) = fs::read_to_string(&local_filename) {
+        let local_value: serde_yaml::Value = serde_yaml::from_str(&local_yaml_string)
+            .unwrap_or_else(|e| panic!("Unable to parse local config {}: {}", local_filename, e));
+        deep_merge(&mut yaml_value, local_value);
+        eprintln!("Merged local config from {}", local_filename);
+    }
+
+    let config: YamlConfig = serde_yaml::from_value(yaml_value)
+        .expect("Unable to parse config");
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
