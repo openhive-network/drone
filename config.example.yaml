@@ -1,3 +1,7 @@
+# Drone configuration
+# Local overrides: if config.local.yaml exists, its values are deep-merged
+# on top of this file.  Use it for deployment-specific settings (metrics,
+# logging, debug endpoints) so this file can be updated without conflicts.
 ---
 drone:
   port: 9000
