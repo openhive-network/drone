@@ -266,12 +266,28 @@ struct APICallResponse {
     tracking_info: Option<ResponseTrackingInfo>
 }
 
+/// Forces deserialization of the inner Option so that JSON `null` becomes `Some(None)` rather
+/// than being swallowed as the outer `None`. Combined with `#[serde(default)]` (absent key ->
+/// outer `None`), this lets `result` distinguish three cases:
+///   - key absent          -> None         (non-JSON-RPC body; an error per issue #1)
+///   - `"result": null`    -> Some(None)   (a legitimate empty result)
+///   - `"result": <value>` -> Some(Some(_))
+fn deserialize_optional_result<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<Box<RawValue>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<Box<RawValue>>::deserialize(deserializer)?))
+}
+
 /// Targeted deserialization of upstream JSON-RPC responses. The "result" field
 /// is kept as an unparsed raw JSON string (via RawValue), avoiding the 3-4x memory
 /// overhead of building a full serde_json::Value tree for every response.
 #[derive(Deserialize)]
 struct UpstreamJsonRpcResponse {
-    result: Option<Box<RawValue>>,
+    #[serde(default, deserialize_with = "deserialize_optional_result")]
+    result: Option<Option<Box<RawValue>>>,
     error: Option<Value>,
 }
 
@@ -438,6 +454,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // to simulate slow calls, put a sleep here
     // sleep(Duration::from_secs(10)).await;
 
+    // Capture the HTTP status before the body is consumed. Backends like PostgREST report
+    // failures (e.g. statement timeout) via a non-2xx status with a non-JSON-RPC error body.
+    let upstream_status = res.status();
+
     let body = match res.text().await {
         Ok(text) => text,
         Err(err) => {
@@ -496,10 +516,37 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         }
     }
 
+    // Surface a retryable error instead of silently returning result: null (issue #1):
+    //   (a) the backend reported a non-success HTTP status, or
+    //   (b) the body is not a JSON-RPC envelope (no `result` key and no `error`).
+    // upstream_resp.result.is_none() means the `result` key was absent; a legitimate
+    // `"result": null` deserializes to Some(None) and is left untouched below.
+    if !upstream_status.is_success() || upstream_resp.result.is_none() {
+        let snippet = &body[..body.len().min(2048)];
+        debug!(request_id=request_id.as_str(); "Upstream returned a non-JSON-RPC error (status {}): {}", upstream_status, snippet);
+        let backend_duration_secs = backend_start.elapsed().as_secs_f64();
+        return CacheEntry {
+            result: Err(ErrorData {
+                error: json!({
+                    "code": -32603,
+                    "message": "Upstream backend returned an error.",
+                    "error": snippet,
+                    "http_status": upstream_status.as_u16(),
+                }),
+                http_status: StatusCode::BAD_GATEWAY,
+                backend_duration_secs: Some(backend_duration_secs)
+            }),
+            size: 0,
+            ttl: CacheTtl::NoCache
+        };
+    }
+
     // Get raw result string
     let result_json_str = match upstream_resp.result {
-        Some(ref raw) => raw.get(),
-        None => "null",
+        Some(Some(ref raw)) => raw.get(),
+        // Explicit `"result": null` — a legitimate empty result. The absent-key case is already
+        // handled by the guard above, so this `None` arm is just a defensive fallback.
+        Some(None) | None => "null",
     };
 
     // if the call was to get_dynamic_global_properties, save off the last irreversible block
@@ -1102,4 +1149,32 @@ async fn main() -> std::io::Result<()> {
     .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpstreamJsonRpcResponse;
+
+    // The issue #1 fix relies on `Option<Option<Box<RawValue>>>` + `#[serde(default)]`
+    // distinguishing an absent `result` key from an explicit `"result": null`. If this ever
+    // regressed (e.g. someone "simplified" it back to `Option<Box<RawValue>>`), a backend error
+    // body with neither key would again be masked as a legitimate null result.
+    #[test]
+    fn result_key_presence_is_distinguishable() {
+        // Present value -> Some(Some(_))
+        let v: UpstreamJsonRpcResponse = serde_json::from_str(r#"{"result":5}"#).unwrap();
+        assert!(matches!(v.result, Some(Some(_))));
+        assert!(v.error.is_none());
+
+        // Explicit null -> Some(None) (a legitimate empty result, must NOT be treated as an error)
+        let n: UpstreamJsonRpcResponse = serde_json::from_str(r#"{"result":null}"#).unwrap();
+        assert!(matches!(n.result, Some(None)));
+
+        // Non-JSON-RPC error body (no result, no error keys) -> None (the masked-error case)
+        let e: UpstreamJsonRpcResponse =
+            serde_json::from_str(r#"{"code":"57014","message":"canceling statement due to statement timeout"}"#)
+                .unwrap();
+        assert!(e.result.is_none());
+        assert!(e.error.is_none());
+    }
 }
