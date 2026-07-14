@@ -63,6 +63,13 @@ pub struct DroneConfig {
     #[serde(default)]
     pub access_log_flush_every_line: bool,
 
+    /// whether to trust the `X-Forwarded-For` header for the real client IP. Enable this only
+    /// when drone runs behind a reverse proxy that sets it (e.g. Caddy/HAProxy); otherwise a
+    /// client could spoof its IP. When enabled and `CF-Connecting-IP` is absent, the left-most
+    /// address in `X-Forwarded-For` is used as the client IP. Default: false.
+    #[serde(default)]
+    pub trust_forwarded_for: bool,
+
     /// whether to enable Prometheus metrics endpoint
     #[serde(default)]
     pub metrics_enabled: bool,
@@ -201,7 +208,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),

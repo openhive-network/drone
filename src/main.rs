@@ -909,7 +909,24 @@ async fn api_call(
 
     let client_ip = match get_cloudflare_ip {
         Some(ip) => ip.to_str().map(|ip| ip.to_string()),
-        None => Ok(req.peer_addr().unwrap().ip().to_string()),
+        None => {
+            // Behind a reverse proxy (e.g. Caddy/HAProxy) the peer address is the proxy, not the
+            // client. When configured to trust it, use the left-most address of X-Forwarded-For.
+            let forwarded_ip = if data.config.drone.trust_forwarded_for {
+                req.headers()
+                    .get("X-Forwarded-For")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(',').next())
+                    .map(|ip| ip.trim().to_string())
+                    .filter(|ip| !ip.is_empty())
+            } else {
+                None
+            };
+            match forwarded_ip {
+                Some(ip) => Ok(ip),
+                None => Ok(req.peer_addr().unwrap().ip().to_string()),
+            }
+        }
     };
     let user_ip = match client_ip {
         Ok(ip) => ip,
