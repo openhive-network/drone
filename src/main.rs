@@ -374,6 +374,19 @@ fn get_block_number_from_result(result: &Value, request_id: &RequestId) -> Optio
     None
 }
 
+/// Returns true when a get_block / get_block_header answer carries no block.  hived answers a
+/// request for a block that hasn't been produced yet (typically a client polling for head+1) with
+/// `{}` or `null` rather than an error, so this is an empty result, not an unsupported method.
+fn is_block_result_empty(method: &str, result: &Value) -> bool {
+    if method != "get_block" && method != "get_block_header" {
+        return false;
+    }
+    match result.as_object() {
+        Some(obj) => !["block", "header", "block_id", "previous"].iter().any(|key| obj.contains_key(*key)),
+        None => true,
+    }
+}
+
 // check a request to see if it's asking for a block that doesn't exist yet.  We get a lot of API
 // calls that do this, presumably clients that are just polling for the next block.
 // This is a case we can optimize.  Either by:
@@ -615,7 +628,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             TtlValue::NoExpire => { CacheTtl::NoExpire }
             TtlValue::ExpireIfReversible => {
                 // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-                if let Some(block_number) = parsed_result.as_ref().and_then(|v| get_block_number_from_result(v, request_id)) {
+                if parsed_result.as_ref().is_some_and(|v| is_block_result_empty(method_name_only, v)) {
+                    debug!(request_id=request_id.as_str(); "{method_and_params_str} returned no block, not caching");
+                    CacheTtl::NoCache
+                } else if let Some(block_number) = parsed_result.as_ref().and_then(|v| get_block_number_from_result(v, request_id)) {
                     let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
                     if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
                 } else {
@@ -1187,7 +1203,34 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::UpstreamJsonRpcResponse;
+    use super::{is_block_result_empty, UpstreamJsonRpcResponse};
+    use serde_json::json;
+
+    #[test]
+    fn get_block_without_a_block_is_empty() {
+        // appbase block_api.get_block / get_block_header for a block not produced yet
+        assert!(is_block_result_empty("get_block", &json!({})));
+        assert!(is_block_result_empty("get_block_header", &json!({})));
+        // hived (condenser / database_api) shape
+        assert!(is_block_result_empty("get_block", &json!(null)));
+        assert!(is_block_result_empty("get_block_header", &json!(null)));
+    }
+
+    #[test]
+    fn get_block_with_a_block_is_not_empty() {
+        let block_id = "04c9b5a0e1a6c1f0e7b5d3c2a1f0e9d8c7b6a5f4";
+        assert!(!is_block_result_empty("get_block", &json!({"block": {"block_id": block_id}})));
+        assert!(!is_block_result_empty("get_block_header", &json!({"header": {"previous": block_id}})));
+        assert!(!is_block_result_empty("get_block", &json!({"block_id": block_id, "transactions": []})));
+        assert!(!is_block_result_empty("get_block_header", &json!({"previous": block_id})));
+    }
+
+    #[test]
+    fn other_methods_are_never_treated_as_empty_blocks() {
+        // a misconfigured EXPIRE_IF_REVERSIBLE method must still reach the ERROR path
+        assert!(!is_block_result_empty("get_accounts", &json!({})));
+        assert!(!is_block_result_empty("get_dynamic_global_properties", &json!({"head_block_number": 1})));
+    }
 
     // The issue #1 fix relies on `Option<Option<Box<RawValue>>>` + `#[serde(default)]`
     // distinguishing an absent `result` key from an explicit `"result": null`. If this ever
