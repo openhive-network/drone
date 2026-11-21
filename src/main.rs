@@ -37,6 +37,9 @@ pub mod method_renamer;
 use method_renamer::MethodAndParams;
 
 pub mod metrics;
+
+pub mod account_history;
+use account_history::HistoryPage;
 use metrics::DroneMetrics;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -564,7 +567,8 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
     // Only parse the result JSON for methods that actually need it
     let needs_parsed_result = method_name_only == "get_dynamic_global_properties"
-        || ttl_from_config == TtlValue::ExpireIfReversible;
+        || ttl_from_config == TtlValue::ExpireIfReversible
+        || matches!(ttl_from_config, TtlValue::ExpireIfReversibleHistory { .. });
 
     let parsed_result: Option<Value> = if needs_parsed_result {
         serde_json::from_str(result_json_str).ok()
@@ -619,6 +623,19 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     // result, or the config has specified ExpireIfReversible for a call that isn't
                     // supported by get_block_number_from_result
                     CacheTtl::NoCache
+                }
+            }
+            TtlValue::ExpireIfReversibleHistory { fallback_seconds } => {
+                match parsed_result.as_ref() {
+                    Some(result_val) => {
+                        let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
+                        match account_history::classify_page(mapped_method.params.as_ref(), result_val, last_irreversible_block_number) {
+                            HistoryPage::Fixed => { CacheTtl::NoExpire }
+                            HistoryPage::Mutable => { CacheTtl::CacheForDuration(Duration::from_secs(fallback_seconds as u64)) }
+                            HistoryPage::Empty => { CacheTtl::NoCache }
+                        }
+                    }
+                    None => { CacheTtl::NoCache }
                 }
             }
             TtlValue::HonorUpstreamCacheControl => { CacheTtl::NoCache /* TODO: implement this */ }
