@@ -12,6 +12,9 @@ pub enum TtlValue {
     NoExpire,
     /// If irreversible, cache forever.  Otherwise, cache for 9 seconds
     ExpireIfReversible,
+    /// For `get_account_history`: cache forever if the page is complete and irreversible (see
+    /// `account_history::classify_page`).  Otherwise, cache for the fallback number of seconds
+    ExpireIfReversibleHistory { fallback_seconds: u32 },
     /// Expect the upstream server to tell us how long to cache via a `Cache-Control: max-age=`  HTTP header
     HonorUpstreamCacheControl,
     /// Cache response for a fixed amount of time
@@ -135,10 +138,19 @@ enum YamlSpecialTtlValue {
     HonorUpstreamCacheControl,
 }
 
+/// Written in YAML as `EXPIRE_IF_REVERSIBLE_HISTORY: <fallback seconds>`
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct YamlHistoryTtlValue {
+    #[serde(rename = "EXPIRE_IF_REVERSIBLE_HISTORY")]
+    fallback_seconds: u32,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 enum YamlTtlValue {
     SpecialValue(YamlSpecialTtlValue),
+    HistoryValue(YamlHistoryTtlValue),
     DurationInSeconds(u32)
 }
 
@@ -149,6 +161,7 @@ fn ttl_value_from_yaml(ttl: &YamlTtlValue) -> TtlValue {
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoExpire) => { TtlValue::NoExpire }
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::ExpireIfReversible) => { TtlValue::ExpireIfReversible }
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::HonorUpstreamCacheControl) => { TtlValue::HonorUpstreamCacheControl }
+        YamlTtlValue::HistoryValue(history) => { TtlValue::ExpireIfReversibleHistory { fallback_seconds: history.fallback_seconds } }
         YamlTtlValue::DurationInSeconds(n) => { TtlValue::DurationInSeconds(*n) } 
     }
 }
@@ -250,4 +263,22 @@ pub fn parse_file(filename: &str) -> AppConfig {
         }
     }
     app_config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ttl_value_from_yaml, TtlValue, YamlTtlValue};
+
+    fn parse_ttl(yaml: &str) -> TtlValue {
+        ttl_value_from_yaml(&serde_yaml::from_str::<YamlTtlValue>(yaml).unwrap())
+    }
+
+    #[test]
+    fn ttl_values_parse_from_yaml() {
+        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6 });
+        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE"), TtlValue::ExpireIfReversible);
+        assert_eq!(parse_ttl("NO_CACHE"), TtlValue::NoCache);
+        assert_eq!(parse_ttl("6"), TtlValue::DurationInSeconds(6));
+        assert!(serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err());
+    }
 }

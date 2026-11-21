@@ -113,6 +113,15 @@ urls:
 # the call for EXPIRE_IF_REVERSIBLE to work, otherwise it will treat 
 # this as NO_CACHE.  Currently Drone knows how to decode get_block & 
 # get_block_header responses
+#
+# EXPIRE_IF_REVERSIBLE_HISTORY: <seconds> is for get_account_history
+# (condenser_api and account_history_api).  A page is cached forever only
+# if the request has an explicit start (not -1) and no operation filter,
+# the last returned entry's sequence number equals start, and every
+# returned operation is irreversible.  Any other non-empty page is cached
+# for <seconds>, e.g.
+#   appbase.condenser_api.get_account_history:
+#     EXPIRE_IF_REVERSIBLE_HISTORY: 6
 ttls:
   hived: 3
   hived.login_api: NO_CACHE
