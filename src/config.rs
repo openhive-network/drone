@@ -12,9 +12,10 @@ pub enum TtlValue {
     NoExpire,
     /// If irreversible, cache forever.  Otherwise, cache for 9 seconds
     ExpireIfReversible,
-    /// For `get_account_history`: cache forever if the page is complete and irreversible (see
-    /// `account_history::classify_page`).  Otherwise, cache for the fallback number of seconds
-    ExpireIfReversibleHistory { fallback_seconds: u32 },
+    /// For `get_account_history`: cache for `fixed_seconds` if the page is complete and
+    /// irreversible (see `account_history::classify_page`).  Otherwise, cache for the fallback
+    /// number of seconds
+    ExpireIfReversibleHistory { fallback_seconds: u32, fixed_seconds: u32 },
     /// Expect the upstream server to tell us how long to cache via a `Cache-Control: max-age=`  HTTP header
     HonorUpstreamCacheControl,
     /// Cache response for a fixed amount of time
@@ -138,12 +139,20 @@ enum YamlSpecialTtlValue {
     HonorUpstreamCacheControl,
 }
 
-/// Written in YAML as `EXPIRE_IF_REVERSIBLE_HISTORY: <fallback seconds>`
+/// Fixed history pages are not cached forever: the backend's account-operation numbering can
+/// change under drone (e.g. a HAF upgrade or replay, hive#867), and a bounded TTL corrects that.
+const DEFAULT_HISTORY_FIXED_SECONDS: u32 = 3600;
+fn default_history_fixed_seconds() -> u32 { DEFAULT_HISTORY_FIXED_SECONDS }
+
+/// Written in YAML as `EXPIRE_IF_REVERSIBLE_HISTORY: <fallback seconds>`, optionally with
+/// `fixed_seconds: <seconds>` in the same mapping
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct YamlHistoryTtlValue {
     #[serde(rename = "EXPIRE_IF_REVERSIBLE_HISTORY")]
     fallback_seconds: u32,
+    #[serde(default = "default_history_fixed_seconds")]
+    fixed_seconds: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -161,7 +170,7 @@ fn ttl_value_from_yaml(ttl: &YamlTtlValue) -> TtlValue {
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoExpire) => { TtlValue::NoExpire }
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::ExpireIfReversible) => { TtlValue::ExpireIfReversible }
         YamlTtlValue::SpecialValue(YamlSpecialTtlValue::HonorUpstreamCacheControl) => { TtlValue::HonorUpstreamCacheControl }
-        YamlTtlValue::HistoryValue(history) => { TtlValue::ExpireIfReversibleHistory { fallback_seconds: history.fallback_seconds } }
+        YamlTtlValue::HistoryValue(history) => { TtlValue::ExpireIfReversibleHistory { fallback_seconds: history.fallback_seconds, fixed_seconds: history.fixed_seconds } }
         YamlTtlValue::DurationInSeconds(n) => { TtlValue::DurationInSeconds(*n) } 
     }
 }
@@ -275,10 +284,14 @@ mod tests {
 
     #[test]
     fn ttl_values_parse_from_yaml() {
-        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6 });
+        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 3600 });
+        assert_eq!(parse_ttl("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_seconds: 600}"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 600 });
+        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6\nfixed_seconds: 600"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 600 });
         assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE"), TtlValue::ExpireIfReversible);
         assert_eq!(parse_ttl("NO_CACHE"), TtlValue::NoCache);
         assert_eq!(parse_ttl("6"), TtlValue::DurationInSeconds(6));
         assert!(serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err());
+        assert!(serde_yaml::from_str::<YamlTtlValue>("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_second: 600}").is_err());
+        assert!(serde_yaml::from_str::<YamlTtlValue>("{fixed_seconds: 600}").is_err());
     }
 }
