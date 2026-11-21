@@ -1,0 +1,81 @@
+# Profile for hive/drone, written by `aidev project scaffold` (#13561).
+#
+# Schema reference: docs/architecture/project-profile.md
+# Onboarding procedure: the `onboard-external-project` skill.
+# Guide: docs/operations/onboarding-an-external-project.md
+#
+# The generator writes a starting point, not a governed answer: every
+# binding below is the command a maintainer said this project runs, and it
+# is reviewed and edited like any other declaration.
+version: 2
+project: drone
+
+gitlab:
+  host: "gitlab.syncad.com"
+  path: "hive/drone"
+  id: 446
+
+# The hive topology (as hive/common-ci-configuration): session/<name> ->
+# aidev/integration (protected, cut from develop). develop is protected and
+# fast-forward only: hand off by merge request, as a linear
+# one-commit-per-change copy (aidev docs/operations/project-handoff.md). The
+# release (develop -> master, tags) stays the project's own process.
+branches:
+  integration: "aidev/integration"
+  handoff: "develop"
+  handoff_history: "linear"
+
+# How this project's suites execute (#13892): one kind, stated once. The image
+# carries the Rust toolchain (rust:bullseye, as the project's Dockerfile),
+# cargo-nextest and Cargo.lock's dependencies precompiled, because AIDEV runs it
+# with no network (.aidev/runtime/Dockerfile). It moves with Cargo.lock:
+# rebuild and re-pin with .aidev/runtime/build.sh.
+environment:
+  kind: "container"
+  image: "registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:f9e736b46d48f71f85cb5c7b5063223a5c797c55f8744ecafa0166dda0915dd0"
+  inputs: ["Cargo.lock"]
+
+issues:
+  intake_label: todo
+  taxonomy: ".aidev/labels.yaml"
+  decompose:
+    # `never` is where an external project starts: nothing marks work
+    # approved on this project's behalf until there is a track record.
+    auto_todo: never
+  # Reports about this project's work are filed against this project.
+  watcher_reports: self
+
+# Verification slots. Each binding is what this project genuinely runs for
+# that slot — never one selection repeated under seven names, which makes
+# seven gates report on the same evidence while claiming to check seven
+# different things.
+#
+# One suite (the cargo tests; junit via cargo-nextest into test-results/).
+# full and canary add `cargo check --release` (the build the image ships).
+# `coverage` runs the same tests (the coverage-improve phase needs a binding;
+# there is no coverage tool in the image yet). static and system are unbound:
+# drone has no linter run or system suite yet.
+verification:
+  quick:
+    adapter: command
+    args: [".aidev/run-tests.sh"]
+    artifacts: ["test-results/"]
+  full:
+    adapter: command
+    args: [".aidev/run-tests.sh", "--release"]
+    artifacts: ["test-results/"]
+  baseline:
+    adapter: command
+    args: [".aidev/run-tests.sh"]
+    artifacts: ["test-results/"]
+  canary:
+    adapter: command
+    args: [".aidev/run-tests.sh", "--release"]
+    artifacts: ["test-results/"]
+  coverage:
+    adapter: command
+    args: [".aidev/run-tests.sh"]
+    artifacts: ["test-results/"]
+
+# Capability grants for target-side code. Empty until this project needs one.
+capabilities: []

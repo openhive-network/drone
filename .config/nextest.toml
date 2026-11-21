@@ -1,0 +1,10 @@
+# AIDEV's test slots run `cargo nextest run --profile aidev` (.aidev/run-tests.sh);
+# the junit report is the per-test evidence AIDEV records from test-results/.
+[store]
+dir = "test-results/nextest"
+
+[profile.aidev]
+fail-fast = false
+
+[profile.aidev.junit]
+path = "junit.xml"

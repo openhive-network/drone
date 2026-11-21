@@ -1,3 +1,11 @@
+# AIDEV's own branches (ai/*, session/*, _deploy-canary*) start no pipeline;
+# AIDEV runs drone's tests itself (.aidev/). Everything else runs as before.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(ai\/|session\/|_deploy-canary)/'
+      when: never
+    - when: always
+
 stages:
   - build
   - publish-develop
