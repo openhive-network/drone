@@ -115,13 +115,20 @@ urls:
 # get_block_header responses
 #
 # EXPIRE_IF_REVERSIBLE_HISTORY: <seconds> is for get_account_history
-# (condenser_api and account_history_api).  A page is cached forever only
-# if the request has an explicit start (not -1) and no operation filter,
-# the last returned entry's sequence number equals start, and every
-# returned operation is irreversible.  Any other non-empty page is cached
-# for <seconds>, e.g.
+# (condenser_api and account_history_api).  A page is "fixed" only if the
+# request has an explicit start (not -1) and no operation filter, the last
+# returned entry's sequence number equals start, and every returned
+# operation is irreversible.  Fixed pages are cached for fixed_seconds
+# (default 3600).  Any other non-empty page is cached for <seconds>, e.g.
 #   appbase.condenser_api.get_account_history:
 #     EXPIRE_IF_REVERSIBLE_HISTORY: 6
+#     fixed_seconds: 3600
+# Fixed pages are not cached forever because the backend's account-operation
+# numbering can change under a running drone: a HAF upgrade or replay can
+# renumber histories (e.g. hive#867 made delegate_rc inside custom_json a
+# separate operation), as can a backend swap, failover to a backend on a
+# different HAF build, or a resync.  fixed_seconds bounds how long drone
+# keeps serving pages numbered by the old backend.
 ttls:
   hived: 3
   hived.login_api: NO_CACHE

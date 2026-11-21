@@ -301,6 +301,14 @@ enum CacheTtl {
     CacheForDuration(Duration)
 }
 
+fn history_page_ttl(page: HistoryPage, fallback_seconds: u32, fixed_seconds: u32) -> CacheTtl {
+    match page {
+        HistoryPage::Fixed => { CacheTtl::CacheForDuration(Duration::from_secs(fixed_seconds as u64)) }
+        HistoryPage::Mutable => { CacheTtl::CacheForDuration(Duration::from_secs(fallback_seconds as u64)) }
+        HistoryPage::Empty => { CacheTtl::NoCache }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CacheEntry {
     result: Result<ApiCallResponseData, ErrorData>,
@@ -625,15 +633,12 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     CacheTtl::NoCache
                 }
             }
-            TtlValue::ExpireIfReversibleHistory { fallback_seconds } => {
+            TtlValue::ExpireIfReversibleHistory { fallback_seconds, fixed_seconds } => {
                 match parsed_result.as_ref() {
                     Some(result_val) => {
                         let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
-                        match account_history::classify_page(mapped_method.params.as_ref(), result_val, last_irreversible_block_number) {
-                            HistoryPage::Fixed => { CacheTtl::NoExpire }
-                            HistoryPage::Mutable => { CacheTtl::CacheForDuration(Duration::from_secs(fallback_seconds as u64)) }
-                            HistoryPage::Empty => { CacheTtl::NoCache }
-                        }
+                        let page = account_history::classify_page(mapped_method.params.as_ref(), result_val, last_irreversible_block_number);
+                        history_page_ttl(page, fallback_seconds, fixed_seconds)
                     }
                     None => { CacheTtl::NoCache }
                 }
@@ -1187,7 +1192,31 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::UpstreamJsonRpcResponse;
+    use super::{history_page_ttl, CacheTtl, HistoryPage, UpstreamJsonRpcResponse};
+    use std::time::Duration;
+
+    /// The moka expiry the TTL maps to: `None` never expires, `Some(ZERO)` is not cached
+    fn expiry(ttl: CacheTtl) -> Option<Duration> {
+        match ttl {
+            CacheTtl::CacheForDuration(duration) => Some(duration),
+            CacheTtl::NoCache => Some(Duration::ZERO),
+            CacheTtl::NoExpire => None,
+        }
+    }
+
+    #[test]
+    fn fixed_history_page_is_cached_for_fixed_seconds_not_forever() {
+        let ttl = expiry(history_page_ttl(HistoryPage::Fixed, 6, 3600)).expect("fixed pages must not be cached forever");
+        assert!(ttl > Duration::from_secs(12));
+        assert_eq!(ttl, Duration::from_secs(3600));
+        assert_eq!(expiry(history_page_ttl(HistoryPage::Fixed, 6, 600)), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn mutable_and_empty_history_pages_ignore_fixed_seconds() {
+        assert_eq!(expiry(history_page_ttl(HistoryPage::Mutable, 6, 600)), Some(Duration::from_secs(6)));
+        assert_eq!(expiry(history_page_ttl(HistoryPage::Empty, 6, 600)), Some(Duration::ZERO));
+    }
 
     // The issue #1 fix relies on `Option<Option<Box<RawValue>>>` + `#[serde(default)]`
     // distinguishing an absent `result` key from an explicit `"result": null`. If this ever
