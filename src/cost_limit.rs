@@ -1,63 +1,15 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use sequence_trie::SequenceTrie;
 
-use crate::client_net::{canonical, parse_client_ip, prefix_mask_v4, prefix_mask_v6, Network};
+use crate::client_net::{parse_client_ip, Cidr, Network};
 use crate::config::CostLimitConfig;
 
 /// The resources a network's budget is measured in, in the order of `CostLimiter::budgets`
 pub const RESOURCES: [&str; 2] = ["backend_seconds", "response_bytes"];
-
-/// An allowlist entry: `a.b.c.d/n`, `x::y/n`, or a single address
-#[derive(Debug, Clone, Copy)]
-struct Cidr {
-    addr: IpAddr,
-    prefix: u8,
-}
-
-impl Cidr {
-    fn parse(text: &str) -> Result<Cidr, String> {
-        let (addr_text, prefix_text) = match text.split_once('/') {
-            Some((addr_text, prefix_text)) => (addr_text, Some(prefix_text)),
-            None => (text, None),
-        };
-        let addr = canonical(
-            addr_text
-                .trim()
-                .parse::<IpAddr>()
-                .map_err(|e| format!("invalid allowlist address \"{text}\": {e}"))?,
-        );
-        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
-        let prefix = match prefix_text {
-            Some(prefix_text) => prefix_text
-                .trim()
-                .parse::<u8>()
-                .ok()
-                .filter(|prefix| *prefix <= max_prefix)
-                .ok_or_else(|| format!("invalid allowlist prefix length in \"{text}\""))?,
-            None => max_prefix,
-        };
-        Ok(Cidr { addr, prefix })
-    }
-
-    fn contains(&self, ip: IpAddr) -> bool {
-        match (self.addr, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = prefix_mask_v4(self.prefix);
-                u32::from(net) & mask == u32::from(ip) & mask
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = prefix_mask_v6(self.prefix);
-                u128::from(net) & mask == u128::from(ip) & mask
-            }
-            _ => false,
-        }
-    }
-}
 
 /// Whether a request from a client may go to the backend
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,7 +84,8 @@ impl CostLimiter {
             .allowlist
             .iter()
             .map(|entry| Cidr::parse(entry))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("cost_limit.allowlist: {e}"))?;
         let mut method_weights = SequenceTrie::new();
         for (method, weight) in &config.method_weights {
             if !(weight.is_finite() && *weight >= 0.0) {

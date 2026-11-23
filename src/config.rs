@@ -89,11 +89,19 @@ pub struct DroneConfig {
     pub access_log_flush_every_line: bool,
 
     /// whether to trust the `X-Forwarded-For` header for the real client IP. Enable this only
-    /// when drone runs behind a reverse proxy that sets it (e.g. Caddy/HAProxy); otherwise a
-    /// client could spoof its IP. When enabled and `CF-Connecting-IP` is absent, the left-most
-    /// address in `X-Forwarded-For` is used as the client IP. Default: false.
+    /// when drone runs behind a reverse proxy that appends to it (e.g. Caddy/HAProxy). When
+    /// enabled and `CF-Connecting-IP` is absent, the client IP is the right-most address of
+    /// `X-Forwarded-For` that is not one of `trusted_proxies`, so entries the client wrote
+    /// itself are ignored. Default: false.
     #[serde(default)]
     pub trust_forwarded_for: bool,
+
+    /// the reverse proxies (CIDR, e.g. `10.0.0.0/8`, or a single address) whose
+    /// `X-Forwarded-For` entries are believed when `trust_forwarded_for` is set.  When set, a
+    /// connection from a peer outside the list has its `X-Forwarded-For` ignored.  Empty (the
+    /// default) trusts only the connecting peer: one proxy hop.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 
     /// whether to enable Prometheus metrics endpoint
     #[serde(default)]
@@ -334,6 +342,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
             access_log_file: String::new(),
             access_log_flush_every_line: false,
             trust_forwarded_for: false,
+            trusted_proxies: Vec::new(),
             metrics_enabled: true,
             metrics_path: "/metrics".to_string(),
             metrics_namespace: "drone".to_string(),
