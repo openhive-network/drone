@@ -24,6 +24,16 @@ drone:
   # When false, uses buffered writes with 5-second periodic flushes for better performance
   # When true, flushes immediately after each log entry (higher I/O but no delay)
   access_log_flush_every_line: false
+  # Behind a reverse proxy (Caddy/HAProxy/nginx) that appends the peer address to
+  # X-Forwarded-For, take the client IP from that header instead of the TCP peer.  Only the
+  # right-hand end of the header is believed: the client IP is the right-most entry that is not
+  # one of trusted_proxies, so addresses a client puts in its own X-Forwarded-For are ignored.
+  # trusted_proxies empty: one proxy hop, the right-most entry is the client.  With two or more
+  # hops (e.g. a CDN in front of a local proxy) list every proxy; a connection from a peer
+  # outside the list then has its X-Forwarded-For ignored.  CF-Connecting-IP, when present,
+  # takes precedence over both.
+  trust_forwarded_for: false
+  trusted_proxies: []         # CIDRs or single addresses, e.g. [10.0.0.0/8, 198.51.100.0/24]
   # Prometheus metrics configuration
   metrics_enabled: true        # Enable/disable the /metrics endpoint
   metrics_path: "/metrics"     # Path for Prometheus scraping
