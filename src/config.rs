@@ -92,6 +92,39 @@ pub struct DroneConfig {
 }
 
 
+fn default_cost_limit_window_seconds() -> u64 { 60 }
+
+/// Per-client-network budget for the backend cost of cache misses.  Read from the optional
+/// top-level `cost_limit` section; see `cost_limit::CostLimiter` for how it is enforced.
+#[derive(Clone, Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CostLimitConfig {
+    /// whether the limiter is active.  Default: false
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// the window the budgets apply to: a network's spent cost drains at budget/window_seconds
+    #[serde(default = "default_cost_limit_window_seconds")]
+    pub window_seconds: u64,
+
+    /// backend seconds of cache misses a network may spend per window (unset = not limited)
+    #[serde(default)]
+    pub backend_seconds: Option<f64>,
+
+    /// response bytes of cache misses a network may receive per window (unset = not limited)
+    #[serde(default)]
+    pub response_bytes: Option<u64>,
+
+    /// client networks (CIDR, e.g. `10.0.0.0/8`, or a single address) that are never throttled
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+
+    /// cost multiplier per method, matched like `ttls` (most specific dotted prefix wins).
+    /// Methods without a match have weight 1
+    #[serde(default)]
+    pub method_weights: HashMap<String, f64>,
+}
+
 /// Backend information containing both the URL and friendly name
 #[derive(Debug, Clone)]
 pub struct BackendInfo {
@@ -109,6 +142,7 @@ pub struct AppConfig {
     pub ttls: SequenceTrie<String, TtlValue>,
     pub timeouts: SequenceTrie<String, u32>,
     pub equivalent_methods: HashMap<String, String>,
+    pub cost_limit: CostLimitConfig,
 }
 
 impl AppConfig {
@@ -185,6 +219,8 @@ struct YamlConfig {
     ttls: HashMap<String, YamlTtlValue>,
     timeouts: HashMap<String, u32>,
     equivalent_methods: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    cost_limit: CostLimitConfig,
 }
 
 /// Deep-merge two YAML values.  Fields in `override_val` take precedence.
@@ -236,7 +272,8 @@ pub fn parse_file(filename: &str) -> AppConfig {
         urls: SequenceTrie::new(),
         ttls: SequenceTrie::new(),
         timeouts: SequenceTrie::new(),
-        equivalent_methods: HashMap::new()
+        equivalent_methods: HashMap::new(),
+        cost_limit: config.cost_limit,
     };
 
     app_config.drone = config.drone;
@@ -276,7 +313,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ttl_value_from_yaml, TtlValue, YamlTtlValue};
+    use super::{parse_file, ttl_value_from_yaml, TtlValue, YamlTtlValue};
 
     fn parse_ttl(yaml: &str) -> TtlValue {
         ttl_value_from_yaml(&serde_yaml::from_str::<YamlTtlValue>(yaml).unwrap())
@@ -293,5 +330,16 @@ mod tests {
         assert!(serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_second: 600}").is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{fixed_seconds: 600}").is_err());
+    }
+
+    #[test]
+    fn example_config_documents_a_disabled_cost_limit() {
+        let cost_limit = parse_file("config.example.yaml").cost_limit;
+        assert!(!cost_limit.enabled);
+        assert_eq!(cost_limit.window_seconds, 60);
+        assert_eq!(cost_limit.backend_seconds, Some(60.0));
+        assert_eq!(cost_limit.response_bytes, Some(500_000_000));
+        assert!(cost_limit.allowlist.contains(&"10.0.0.0/8".to_string()));
+        assert_eq!(cost_limit.method_weights.get("appbase.condenser_api.get_account_history"), Some(&1.0));
     }
 }

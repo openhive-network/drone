@@ -1,5 +1,5 @@
 use prometheus::{
-    CounterVec, Gauge, HistogramVec,
+    CounterVec, Gauge, GaugeVec, HistogramVec,
     Opts, Registry, HistogramOpts,
     TextEncoder, Encoder,
 };
@@ -33,6 +33,10 @@ pub struct DroneMetrics {
     // Blockchain state gauges
     pub blockchain_head_block: Gauge,
     pub blockchain_lib: Gauge,
+
+    // Per-client-network cost limiter
+    pub cost_limit_throttled_total: CounterVec,
+    pub cost_limit_usage_ratio: GaugeVec,
 }
 
 impl DroneMetrics {
@@ -107,6 +111,18 @@ impl DroneMetrics {
             "Last irreversible block number"
         ).expect("Failed to create blockchain_lib gauge");
 
+        let cost_limit_throttled_total = CounterVec::new(
+            Opts::new("cost_limit_throttled_total", "Cache-missing requests refused because the client network was over its cost budget")
+                .namespace(namespace),
+            &["network"]
+        ).expect("Failed to create cost_limit_throttled_total counter");
+
+        let cost_limit_usage_ratio = GaugeVec::new(
+            Opts::new("cost_limit_usage_ratio", "Cost a client network has spent, as a fraction of its budget")
+                .namespace(namespace),
+            &["network", "resource"]
+        ).expect("Failed to create cost_limit_usage_ratio gauge");
+
         // Register all metrics
         registry.register(Box::new(requests_total.clone())).expect("Failed to register requests_total");
         registry.register(Box::new(requests_cached_total.clone())).expect("Failed to register requests_cached_total");
@@ -118,6 +134,8 @@ impl DroneMetrics {
         registry.register(Box::new(active_requests.clone())).expect("Failed to register active_requests");
         registry.register(Box::new(blockchain_head_block.clone())).expect("Failed to register blockchain_head_block");
         registry.register(Box::new(blockchain_lib.clone())).expect("Failed to register blockchain_lib");
+        registry.register(Box::new(cost_limit_throttled_total.clone())).expect("Failed to register cost_limit_throttled_total");
+        registry.register(Box::new(cost_limit_usage_ratio.clone())).expect("Failed to register cost_limit_usage_ratio");
 
         DroneMetrics {
             registry,
@@ -131,6 +149,8 @@ impl DroneMetrics {
             active_requests,
             blockchain_head_block,
             blockchain_lib,
+            cost_limit_throttled_total,
+            cost_limit_usage_ratio,
         }
     }
 
@@ -219,6 +239,23 @@ impl DroneMetrics {
     pub fn update_blockchain_state(&self, head_block: u32, lib: u32) {
         self.blockchain_head_block.set(head_block as f64);
         self.blockchain_lib.set(lib as f64);
+    }
+
+    /// Record a request refused by the cost limiter
+    pub fn record_cost_limit_throttled(&self, network: &str) {
+        self.cost_limit_throttled_total
+            .with_label_values(&[network])
+            .inc();
+    }
+
+    /// Replace the per-network budget usage with `ratios` of (network, resource, ratio)
+    pub fn update_cost_limit_usage<'a>(&self, ratios: impl IntoIterator<Item = (&'a str, &'a str, f64)>) {
+        self.cost_limit_usage_ratio.reset();
+        for (network, resource, ratio) in ratios {
+            self.cost_limit_usage_ratio
+                .with_label_values(&[network, resource])
+                .set(ratio);
+        }
     }
 
     /// Increment active requests counter
