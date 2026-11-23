@@ -1,63 +1,16 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use sequence_trie::SequenceTrie;
 
+use crate::client_net::{canonical, parse_client_ip, prefix_mask_v4, prefix_mask_v6, Network};
 use crate::config::CostLimitConfig;
 
 /// The resources a network's budget is measured in, in the order of `CostLimiter::budgets`
 pub const RESOURCES: [&str; 2] = ["backend_seconds", "response_bytes"];
-
-/// A client network, the unit cost is accounted per: an IPv4 /24 or an IPv6 /64
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Network(IpAddr);
-
-impl Network {
-    pub fn of(ip: IpAddr) -> Network {
-        match canonical(ip) {
-            IpAddr::V4(v4) => Network(IpAddr::V4(Ipv4Addr::from(u32::from(v4) & prefix_mask_v4(24)))),
-            IpAddr::V6(v6) => Network(IpAddr::V6(Ipv6Addr::from(u128::from(v6) & prefix_mask_v6(64)))),
-        }
-    }
-}
-
-impl fmt::Display for Network {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            IpAddr::V4(v4) => write!(f, "{v4}/24"),
-            IpAddr::V6(v6) => write!(f, "{v6}/64"),
-        }
-    }
-}
-
-/// IPv4 clients reaching a dual-stack socket appear as `::ffff:a.b.c.d`; key them as IPv4
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
-
-fn prefix_mask_v4(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) }
-}
-
-fn prefix_mask_v6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - u32::from(prefix)) }
-}
-
-/// Parses a client address as resolved from `CF-Connecting-IP` / `X-Forwarded-For` / the peer,
-/// tolerating a trailing port
-fn parse_client_ip(client_ip: &str) -> Option<IpAddr> {
-    let trimmed = client_ip.trim();
-    trimmed.parse::<IpAddr>().ok()
-        .or_else(|| trimmed.parse::<SocketAddr>().ok().map(|socket| socket.ip()))
-        .map(canonical)
-}
 
 /// An allowlist entry: `a.b.c.d/n`, `x::y/n`, or a single address
 #[derive(Debug, Clone, Copy)]
