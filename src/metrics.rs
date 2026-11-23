@@ -8,6 +8,11 @@ const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
+/// Histogram buckets for the size of streamed responses (in bytes), 64 KiB to 64 MiB
+const STREAMED_RESPONSE_BYTES_BUCKETS: &[f64] = &[
+    65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0,
+];
+
 /// DroneMetrics holds all Prometheus metric collectors for Drone
 pub struct DroneMetrics {
     pub registry: Registry,
@@ -20,6 +25,9 @@ pub struct DroneMetrics {
     // Latency histograms
     pub request_duration_seconds: HistogramVec,
     pub backend_duration_seconds: HistogramVec,
+
+    // Responses piped from the backend without buffering
+    pub streamed_response_bytes: HistogramVec,
 
     // Cache gauges
     pub cache_size_bytes: Gauge,
@@ -88,6 +96,17 @@ impl DroneMetrics {
             &["namespace", "api", "method", "backend"],
         )
         .expect("Failed to create backend_duration_seconds histogram");
+
+        let streamed_response_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "streamed_response_bytes",
+                "Size in bytes of backend responses streamed to the client without being cached",
+            )
+            .namespace(namespace)
+            .buckets(STREAMED_RESPONSE_BYTES_BUCKETS.to_vec()),
+            &["namespace", "api", "method"],
+        )
+        .expect("Failed to create streamed_response_bytes histogram");
 
         // Cache gauges
         let cache_size_bytes = Gauge::new(
@@ -202,6 +221,9 @@ impl DroneMetrics {
         registry
             .register(Box::new(client_net_requests_total.clone()))
             .expect("Failed to register client_net_requests_total");
+        registry
+            .register(Box::new(streamed_response_bytes.clone()))
+            .expect("Failed to register streamed_response_bytes");
 
         DroneMetrics {
             registry,
@@ -210,6 +232,7 @@ impl DroneMetrics {
             requests_errors_total,
             request_duration_seconds,
             backend_duration_seconds,
+            streamed_response_bytes,
             cache_size_bytes,
             cache_entries,
             active_requests,
@@ -300,6 +323,13 @@ impl DroneMetrics {
             .observe(duration_seconds);
     }
 
+    /// Record the size of a response streamed from the backend
+    pub fn record_streamed_response(&self, namespace: &str, api: &str, method: &str, bytes: u64) {
+        self.streamed_response_bytes
+            .with_label_values(&[namespace, api, method])
+            .observe(bytes as f64);
+    }
+
     /// Update cache metrics
     pub fn update_cache_metrics(&self, size_bytes: u64, entry_count: u64) {
         self.cache_size_bytes.set(size_bytes as f64);
@@ -333,14 +363,23 @@ impl DroneMetrics {
     }
 
     /// Replace the per-network cost with `costs` of (client_net, backend seconds, response bytes, requests)
-    pub fn update_client_net_costs<'a>(&self, costs: impl IntoIterator<Item = (&'a str, f64, u64, u64)>) {
+    pub fn update_client_net_costs<'a>(
+        &self,
+        costs: impl IntoIterator<Item = (&'a str, f64, u64, u64)>,
+    ) {
         self.client_net_backend_seconds_total.reset();
         self.client_net_response_bytes_total.reset();
         self.client_net_requests_total.reset();
         for (client_net, backend_seconds, response_bytes, requests) in costs {
-            self.client_net_backend_seconds_total.with_label_values(&[client_net]).inc_by(backend_seconds);
-            self.client_net_response_bytes_total.with_label_values(&[client_net]).inc_by(response_bytes as f64);
-            self.client_net_requests_total.with_label_values(&[client_net]).inc_by(requests as f64);
+            self.client_net_backend_seconds_total
+                .with_label_values(&[client_net])
+                .inc_by(backend_seconds);
+            self.client_net_response_bytes_total
+                .with_label_values(&[client_net])
+                .inc_by(response_bytes as f64);
+            self.client_net_requests_total
+                .with_label_values(&[client_net])
+                .inc_by(requests as f64);
         }
     }
 

@@ -45,6 +45,9 @@ fn default_client_cost_top_networks() -> usize {
 fn default_client_cost_window_seconds() -> u64 {
     300
 }
+fn default_stream_min_bytes() -> u64 {
+    1 << 20
+}
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -123,6 +126,17 @@ pub struct DroneConfig {
     /// ranked by.  Default: 300
     #[serde(default = "default_client_cost_window_seconds")]
     pub client_cost_window_seconds: u64,
+
+    /// whether backend responses drone will not cache (a `NO_CACHE` method, or a `Content-Length`
+    /// above `stream_min_bytes`) are piped to the client as they arrive instead of being buffered
+    /// and parsed.  Applies to single (non-batch) calls.  Default: true
+    #[serde(default = "default_to_true")]
+    pub stream_uncached_responses: bool,
+
+    /// with `stream_uncached_responses`, a response whose `Content-Length` exceeds this many
+    /// bytes is streamed and not cached, whatever its method's TTL.  Default: 1 MiB
+    #[serde(default = "default_stream_min_bytes")]
+    pub stream_min_bytes: u64,
 }
 
 fn default_cost_limit_window_seconds() -> u64 {
@@ -327,6 +341,8 @@ pub fn parse_file(filename: &str) -> AppConfig {
             client_cost_metrics: true,
             client_cost_top_networks: default_client_cost_top_networks(),
             client_cost_window_seconds: default_client_cost_window_seconds(),
+            stream_uncached_responses: true,
+            stream_min_bytes: default_stream_min_bytes(),
         },
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
@@ -429,6 +445,13 @@ mod tests {
         )
         .is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{fixed_seconds: 600}").is_err());
+    }
+
+    #[test]
+    fn example_config_streams_uncached_responses_over_1_mib() {
+        let drone = parse_file("config.example.yaml").drone;
+        assert!(drone.stream_uncached_responses);
+        assert_eq!(drone.stream_min_bytes, 1 << 20);
     }
 
     #[test]

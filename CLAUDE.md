@@ -95,6 +95,7 @@ Copy `config.example.yaml` to `config.yaml` and configure:
 - TTL modes: NO_CACHE, NO_EXPIRE, EXPIRE_IF_REVERSIBLE, or fixed seconds
 - EXPIRE_IF_REVERSIBLE: 9s if block is reversible, forever if irreversible
 - Parameter-based cache keys using SHA256 hash
+- `stream_uncached_responses` (default on): single calls with TTL `NO_CACHE`, or whose backend `Content-Length` exceeds `stream_min_bytes`, are piped to the client unbuffered and unparsed (`Answer::Streamed`), bypassing the cache
 
 ## Debug Headers (when `add_jussi_headers: true`)
 
