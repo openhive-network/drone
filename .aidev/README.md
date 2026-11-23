@@ -26,8 +26,15 @@ branches; `aidev/integration` and everything else run as before.
 ## Tests and the test image
 
 - `.aidev/run-tests.sh` runs `cargo nextest run --profile aidev` (junit to
-  `test-results/`, `.config/nextest.toml`); `--release` adds `cargo check --release`.
-  It runs anywhere cargo and cargo-nextest are installed.
+  `test-results/`, `.config/nextest.toml`); `--release` adds `cargo check --release`,
+  and `--coverage` runs the tests under `cargo llvm-cov`, writing a Cobertura
+  `coverage.xml` to `.aidev-artifacts/`. It runs anywhere cargo and cargo-nextest
+  (and cargo-llvm-cov for `--coverage`) are installed.
+- `.aidev/run-static-checks.sh` runs `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings`; either failing fails it.
+- The pinned image does not carry rustfmt, clippy or cargo-llvm-cov yet, so
+  `static` is unbound and `coverage` runs the plain tests until it is rebuilt
+  with them.
 - The platform runs the script inside
   `registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:…` with no network, so the
   image carries the toolchain and `Cargo.lock`'s dependencies. After changing

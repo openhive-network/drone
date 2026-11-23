@@ -11,24 +11,25 @@ static GLOBAL: Jemalloc = Jemalloc;
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:21\0";
 
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
+use actix_web::{
+    http::StatusCode, middleware::Condition, web, App, HttpRequest, HttpResponse,
+    HttpResponseBuilder, HttpServer, Responder,
+};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
-use serde::{Deserialize, Serialize, Serializer};
-use serde_json::{Value, json, value::RawValue};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, value::RawValue, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 //use actix_web::rt::time::sleep;
-use tokio::sync::RwLock;
+use actix_request_identifier::{IdReuse, RequestId, RequestIdentifier};
 use chrono::DateTime;
-use actix_request_identifier::{RequestId, RequestIdentifier, IdReuse};
 use sha256::digest;
+use tokio::sync::RwLock;
 
-use log::{error, warn, info, debug, trace, log_enabled, Level::Info};
-
-
+use log::{debug, error, info, log_enabled, trace, warn, Level::Info};
 
 pub mod config;
 use config::{AppConfig, TtlValue};
@@ -60,11 +61,10 @@ const COST_LIMIT_ERROR_CODE: i32 = -32029;
 /// otherwise carry a series for every network that made a cache miss in the last window
 const COST_LIMIT_GAUGE_MIN_RATIO: f64 = 0.1;
 
-
 struct BlockchainState {
     last_irreversible_block_number: u32,
     head_block_number: u32,
-    head_block_time: SystemTime
+    head_block_time: SystemTime,
 }
 
 impl BlockchainState {
@@ -72,7 +72,7 @@ impl BlockchainState {
         BlockchainState {
             last_irreversible_block_number: 0,
             head_block_number: 0,
-            head_block_time: SystemTime::UNIX_EPOCH
+            head_block_time: SystemTime::UNIX_EPOCH,
         }
     }
 }
@@ -100,12 +100,16 @@ async fn cache_size(appdata: web::Data<AppData>) -> impl Responder {
 
 // return a list of cache keys and their sizes.  Can be huge
 async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
-    let entries: Vec<Value> = appdata.cache.iter().map(|(key, value)| {
-        json!({
-            "key": (*key).to_string(),
-            "size": value.size
+    let entries: Vec<Value> = appdata
+        .cache
+        .iter()
+        .map(|(key, value)| {
+            json!({
+                "key": (*key).to_string(),
+                "size": value.size
+            })
         })
-    }).collect();
+        .collect();
 
     HttpResponse::Ok().json(entries)
 }
@@ -155,7 +159,8 @@ async fn jemalloc_stats_handler() -> impl Responder {
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 async fn heap_profile_handler() -> impl Responder {
     use std::ffi::CString;
-    let currently_active: bool = unsafe { tikv_jemalloc_ctl::raw::read(b"prof.active\0") }.unwrap_or(false);
+    let currently_active: bool =
+        unsafe { tikv_jemalloc_ctl::raw::read(b"prof.active\0") }.unwrap_or(false);
     if !currently_active {
         if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", true) } {
             return HttpResponse::InternalServerError()
@@ -166,8 +171,10 @@ async fn heap_profile_handler() -> impl Responder {
     let path = format!("/tmp/drone_heap_{}.heap", std::process::id());
     let path_cstr = match CString::new(path.clone()) {
         Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError()
-            .json(json!({"error": format!("Invalid path: {}", e)})),
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .json(json!({"error": format!("Invalid path: {}", e)}))
+        }
     };
     if let Err(e) = unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", path_cstr.as_ptr()) } {
         return HttpResponse::InternalServerError()
@@ -182,7 +189,7 @@ async fn heap_profile_handler() -> impl Responder {
                 .body(data)
         }
         Err(e) => HttpResponse::InternalServerError()
-            .json(json!({"error": format!("Failed to read profile dump: {}", e)}))
+            .json(json!({"error": format!("Failed to read profile dump: {}", e)})),
     }
 }
 
@@ -202,7 +209,6 @@ enum ID {
     Int(u32),
 }
 
-
 // Structure for API calls.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct APIRequest {
@@ -213,50 +219,42 @@ pub struct APIRequest {
     params: Option<Value>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-enum ErrorField {
-    Object(Value),   // JSON from Hived
-    Message(String), // Custom message
-}
-
-impl Serialize for ErrorField {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            ErrorField::Object(json_value) => json_value.serialize(serializer),
-            ErrorField::Message(text) => text.serialize(serializer),
-        }
-    }
-}
-
 // data returned just for logging/debugging
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 struct ResponseTrackingInfo {
     cached: bool,
     mapped_method: MethodAndParams, // the method, parsed and transformed
     backend_url: Option<String>,
-    upstream_method: Option<String>
+    upstream_method: Option<String>,
 }
 
 impl ResponseTrackingInfo {
     fn into_headers(self, reply_builder: &mut HttpResponseBuilder) {
         reply_builder.insert_header(("X-Jussi-Cache-Hit", self.cached.to_string()));
         reply_builder.insert_header(("X-Jussi-Namespace", self.mapped_method.namespace));
-        reply_builder.insert_header(("X-Jussi-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
+        reply_builder.insert_header((
+            "X-Jussi-Api",
+            self.mapped_method.api.unwrap_or("<Empty>".to_string()),
+        ));
         reply_builder.insert_header(("X-Jussi-Method", self.mapped_method.method));
-        // removed params because it can be huge for posts, and can easily overflow nginx 
+        // removed params because it can be huge for posts, and can easily overflow nginx
         // proxy buffer
         // reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
         // instead print the hash of the parameters, we can use that to tell which calls are
         // identical even if we don't know exactly what the parameters were
-        reply_builder.insert_header(("X-Jussi-Param-Hash", digest(self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string()))));
-        if self.backend_url.is_some() {
-            reply_builder.insert_header(("X-Jussi-Backend-Url", self.backend_url.unwrap()));
+        reply_builder.insert_header((
+            "X-Jussi-Param-Hash",
+            digest(
+                self.mapped_method
+                    .params
+                    .map_or("[]".to_string(), |v| v.to_string()),
+            ),
+        ));
+        if let Some(backend_url) = self.backend_url {
+            reply_builder.insert_header(("X-Jussi-Backend-Url", backend_url));
         }
-        if self.upstream_method.is_some() {
-            reply_builder.insert_header(("X-Jussi-Upstream-Method", self.upstream_method.unwrap()));
+        if let Some(upstream_method) = self.upstream_method {
+            reply_builder.insert_header(("X-Jussi-Upstream-Method", upstream_method));
         }
     }
 }
@@ -269,14 +267,14 @@ struct ErrorData {
     error: Value,
     http_status: StatusCode,
     /// Duration of the backend call in seconds (None if cached or no upstream call was made)
-    backend_duration_secs: Option<f64>
+    backend_duration_secs: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
 struct ApiCallResponseData {
     result_json: String,
     /// Duration of the backend call in seconds (None if cached)
-    backend_duration_secs: Option<f64>
+    backend_duration_secs: Option<f64>,
 }
 
 // The full error and response structures, including caller-specific data
@@ -288,7 +286,7 @@ struct ErrorStructure {
     http_status: StatusCode,
     tracking_info: Option<ResponseTrackingInfo>,
     /// seconds for the `Retry-After` header, when the request was refused by the cost limiter
-    retry_after: Option<u64>
+    retry_after: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -300,7 +298,7 @@ struct APICallResponse {
 
     result_json: String,
 
-    tracking_info: Option<ResponseTrackingInfo>
+    tracking_info: Option<ResponseTrackingInfo>,
 }
 
 /// Forces deserialization of the inner Option so that JSON `null` becomes `Some(None)` rather
@@ -332,14 +330,16 @@ struct UpstreamJsonRpcResponse {
 enum CacheTtl {
     NoCache,
     NoExpire,
-    CacheForDuration(Duration)
+    CacheForDuration(Duration),
 }
 
 fn history_page_ttl(page: HistoryPage, fallback_seconds: u32, fixed_seconds: u32) -> CacheTtl {
     match page {
-        HistoryPage::Fixed => { CacheTtl::CacheForDuration(Duration::from_secs(fixed_seconds as u64)) }
-        HistoryPage::Mutable => { CacheTtl::CacheForDuration(Duration::from_secs(fallback_seconds as u64)) }
-        HistoryPage::Empty => { CacheTtl::NoCache }
+        HistoryPage::Fixed => CacheTtl::CacheForDuration(Duration::from_secs(fixed_seconds as u64)),
+        HistoryPage::Mutable => {
+            CacheTtl::CacheForDuration(Duration::from_secs(fallback_seconds as u64))
+        }
+        HistoryPage::Empty => CacheTtl::NoCache,
     }
 }
 
@@ -347,16 +347,18 @@ fn history_page_ttl(page: HistoryPage, fallback_seconds: u32, fixed_seconds: u32
 struct CacheEntry {
     result: Result<ApiCallResponseData, ErrorData>,
     size: u32,
-	ttl: CacheTtl,
+    ttl: CacheTtl,
 }
 
 pub struct MyExpiry;
 
 impl MyExpiry {
     fn get_expiration(&self, key: &String, value: &CacheEntry) -> Option<Duration> {
-		match value.ttl {
-            CacheTtl::NoExpire => { 
-                trace!("get_expiration called with key {key}, returning duration None (never expire).");
+        match value.ttl {
+            CacheTtl::NoExpire => {
+                trace!(
+                    "get_expiration called with key {key}, returning duration None (never expire)."
+                );
                 None
             }
             CacheTtl::NoCache => {
@@ -364,7 +366,10 @@ impl MyExpiry {
                 Some(Duration::ZERO)
             }
             CacheTtl::CacheForDuration(duration) => {
-                trace!("get_expiration called with key {key}, returning duration {:?}", duration);
+                trace!(
+                    "get_expiration called with key {key}, returning duration {:?}",
+                    duration
+                );
                 Some(duration)
             }
         }
@@ -374,7 +379,12 @@ impl MyExpiry {
 impl Expiry<String, CacheEntry> for MyExpiry {
     /// Returns the duration of the expiration of the value that was just
     /// created.
-    fn expire_after_create(&self, key: &String, value: &CacheEntry, _current_time: Instant) -> Option<Duration> {
+    fn expire_after_create(
+        &self,
+        key: &String,
+        value: &CacheEntry,
+        _current_time: Instant,
+    ) -> Option<Duration> {
         self.get_expiration(key, value)
     }
     /// We never explicitly update cache entries, we keep serving data from the cache until the
@@ -385,9 +395,13 @@ impl Expiry<String, CacheEntry> for MyExpiry {
     /// the entry is actually evicted, maybe on the order of ~0.3s.  If we insert a new value
     /// during that window, I think it considers that an "update" and not a "create", so we need to
     /// override expire_after_update too.
-    fn expire_after_update(&self, key: &String, value: &CacheEntry, 
-                           _updated_at: Instant,
-                           _duration_until_expiry: Option<Duration>) -> Option<Duration> {
+    fn expire_after_update(
+        &self,
+        key: &String,
+        value: &CacheEntry,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
         self.get_expiration(key, value)
     }
 }
@@ -396,19 +410,35 @@ impl Expiry<String, CacheEntry> for MyExpiry {
 /// of the backend call to get the block number of the item returned
 fn get_block_number_from_result(result: &Value, request_id: &RequestId) -> Option<u32> {
     // appbase get_block
-    if let Some(block_num) = result.pointer("/block/block_id").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+    if let Some(block_num) = result
+        .pointer("/block/block_id")
+        .and_then(|block_id| block_id.as_str())
+        .and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok())
+    {
         return Some(block_num);
     }
     // appbase get_block_header
-    if let Some(prev_block_num) = result.pointer("/header/previous").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+    if let Some(prev_block_num) = result
+        .pointer("/header/previous")
+        .and_then(|block_id| block_id.as_str())
+        .and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok())
+    {
         return Some(prev_block_num + 1);
     }
     // hived get_block
-    if let Some(block_num) = result.pointer("/block_id").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+    if let Some(block_num) = result
+        .pointer("/block_id")
+        .and_then(|block_id| block_id.as_str())
+        .and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok())
+    {
         return Some(block_num);
     }
     // hived get_block_header
-    if let Some(prev_block_num) = result.pointer("/previous").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+    if let Some(prev_block_num) = result
+        .pointer("/previous")
+        .and_then(|block_id| block_id.as_str())
+        .and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok())
+    {
         return Some(prev_block_num + 1);
     }
 
@@ -424,7 +454,9 @@ fn is_block_result_empty(method: &str, result: &Value) -> bool {
         return false;
     }
     match result.as_object() {
-        Some(obj) => !["block", "header", "block_id", "previous"].iter().any(|key| obj.contains_key(*key)),
+        Some(obj) => !["block", "header", "block_id", "previous"]
+            .iter()
+            .any(|key| obj.contains_key(*key)),
         None => true,
     }
 }
@@ -437,9 +469,17 @@ fn is_block_result_empty(method: &str, result: &Value) -> bool {
 // Waiting seems better, because if we don't, the client will probably just make the same request
 // again (maybe after a short sleep).  And if we do it right, it may give them the block sooner
 // than their polling loop would have.
-async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: &web::Data<AppData>, request_id: &RequestId) {
+async fn check_for_future_block_requests(
+    mapped_method: &MethodAndParams,
+    data: &web::Data<AppData>,
+    request_id: &RequestId,
+) {
     if mapped_method.method == "get_block" {
-        if let Some(block_num) = mapped_method.params.as_ref().and_then(|v| v["block_num"].as_u64()) {
+        if let Some(block_num) = mapped_method
+            .params
+            .as_ref()
+            .and_then(|v| v["block_num"].as_u64())
+        {
             let current_head_block_number = data.blockchain_state.read().await.head_block_number;
             if block_num as u32 > current_head_block_number {
                 // we're only testing against the head block number we recorded the last
@@ -452,11 +492,19 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
     }
 }
 
-async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, request_id: &RequestId) -> CacheEntry {
+async fn request_from_upstream(
+    data: web::Data<AppData>,
+    mapped_method: MethodAndParams,
+    method_and_params_str: String,
+    request_id: &RequestId,
+) -> CacheEntry {
     let backend_start = Instant::now();
 
-    let backend = match data.config.lookup_backend(mapped_method.get_method_name_parts()) {
-        Some(backend) => { backend }
+    let backend = match data
+        .config
+        .lookup_backend(mapped_method.get_method_name_parts())
+    {
+        Some(backend) => backend,
         None => {
             return CacheEntry {
                 result: Err(ErrorData {
@@ -466,10 +514,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": "Unable to map request to endpoint."
                     }),
                     http_status: StatusCode::NOT_FOUND,
-                    backend_duration_secs: None
+                    backend_duration_secs: None,
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
             };
         }
     };
@@ -501,10 +549,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": error_message
                     }),
                     http_status: StatusCode::SERVICE_UNAVAILABLE,
-                    backend_duration_secs: Some(backend_duration_secs)
+                    backend_duration_secs: Some(backend_duration_secs),
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
             };
         }
     };
@@ -529,10 +577,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    backend_duration_secs: Some(backend_duration_secs)
+                    backend_duration_secs: Some(backend_duration_secs),
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
             };
         }
     };
@@ -549,10 +597,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                         "error": err.to_string(),
                     }),
                     http_status: StatusCode::INTERNAL_SERVER_ERROR,
-                    backend_duration_secs: Some(backend_duration_secs)
+                    backend_duration_secs: Some(backend_duration_secs),
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
             };
         }
     };
@@ -566,10 +614,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 result: Err(ErrorData {
                     error: error.clone(),
                     http_status: StatusCode::OK,
-                    backend_duration_secs: Some(backend_duration_secs)
+                    backend_duration_secs: Some(backend_duration_secs),
                 }),
                 size: 0,
-                ttl: CacheTtl::NoCache
+                ttl: CacheTtl::NoCache,
             };
         }
     }
@@ -592,10 +640,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     "http_status": upstream_status.as_u16(),
                 }),
                 http_status: StatusCode::BAD_GATEWAY,
-                backend_duration_secs: Some(backend_duration_secs)
+                backend_duration_secs: Some(backend_duration_secs),
             }),
             size: 0,
-            ttl: CacheTtl::NoCache
+            ttl: CacheTtl::NoCache,
         };
     }
 
@@ -617,7 +665,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         || result_json_str.starts_with("{\"blocks\":[]");
 
     // Look up TTL from config
-    let ttl_from_config = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+    let ttl_from_config = *data
+        .config
+        .lookup_ttl(mapped_method.get_method_name_parts())
+        .unwrap_or(&TtlValue::NoCache);
     debug!(request_id=request_id.as_str(); "lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
 
     // Only parse the result JSON for methods that actually need it
@@ -633,19 +684,24 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
     if method_name_only == "get_dynamic_global_properties" {
         if let Some(ref result_val) = parsed_result {
-            let new_lib = result_val["last_irreversible_block_num"].as_u64().map(|v| v as u32);
+            let new_lib = result_val["last_irreversible_block_num"]
+                .as_u64()
+                .map(|v| v as u32);
             let new_head = result_val["head_block_number"].as_u64().map(|v| v as u32);
             let new_time = result_val["time"].as_str();
             match (new_lib, new_head, new_time) {
                 (Some(new_lib), Some(new_head), Some(new_time)) => {
                     let read_lock = data.blockchain_state.read().await;
-                    if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
+                    if new_lib > read_lock.last_irreversible_block_number
+                        || new_head > read_lock.last_irreversible_block_number
+                    {
                         drop(read_lock);
                         let mut write_lock = data.blockchain_state.write().await;
                         write_lock.last_irreversible_block_number = new_lib;
                         if new_head != write_lock.head_block_number {
                             write_lock.head_block_number = new_head;
-                            let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
+                            let current_head_block_time =
+                                DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
                             write_lock.head_block_time = SystemTime::from(current_head_block_time);
                         }
                         // Update blockchain state metrics
@@ -662,20 +718,32 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     let ttl = if is_empty_result {
         // empty results shouldn't be cached
         CacheTtl::NoCache
-    }
-    else
-    {
+    } else {
         match ttl_from_config {
-            TtlValue::NoCache => { CacheTtl::NoCache }
-            TtlValue::NoExpire => { CacheTtl::NoExpire }
+            TtlValue::NoCache => CacheTtl::NoCache,
+            TtlValue::NoExpire => CacheTtl::NoExpire,
             TtlValue::ExpireIfReversible => {
                 // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-                if parsed_result.as_ref().is_some_and(|v| is_block_result_empty(method_name_only, v)) {
+                if parsed_result
+                    .as_ref()
+                    .is_some_and(|v| is_block_result_empty(method_name_only, v))
+                {
                     debug!(request_id=request_id.as_str(); "{method_and_params_str} returned no block, not caching");
                     CacheTtl::NoCache
-                } else if let Some(block_number) = parsed_result.as_ref().and_then(|v| get_block_number_from_result(v, request_id)) {
-                    let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
-                    if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
+                } else if let Some(block_number) = parsed_result
+                    .as_ref()
+                    .and_then(|v| get_block_number_from_result(v, request_id))
+                {
+                    let last_irreversible_block_number = data
+                        .blockchain_state
+                        .read()
+                        .await
+                        .last_irreversible_block_number;
+                    if block_number > last_irreversible_block_number {
+                        CacheTtl::CacheForDuration(Duration::from_secs(9))
+                    } else {
+                        CacheTtl::NoExpire
+                    }
                 } else {
                     // we couldn't extract a block number from the result.  probably an error
                     // result, or the config has specified ExpireIfReversible for a call that isn't
@@ -683,18 +751,31 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                     CacheTtl::NoCache
                 }
             }
-            TtlValue::ExpireIfReversibleHistory { fallback_seconds, fixed_seconds } => {
-                match parsed_result.as_ref() {
-                    Some(result_val) => {
-                        let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
-                        let page = account_history::classify_page(mapped_method.params.as_ref(), result_val, last_irreversible_block_number);
-                        history_page_ttl(page, fallback_seconds, fixed_seconds)
-                    }
-                    None => { CacheTtl::NoCache }
+            TtlValue::ExpireIfReversibleHistory {
+                fallback_seconds,
+                fixed_seconds,
+            } => match parsed_result.as_ref() {
+                Some(result_val) => {
+                    let last_irreversible_block_number = data
+                        .blockchain_state
+                        .read()
+                        .await
+                        .last_irreversible_block_number;
+                    let page = account_history::classify_page(
+                        mapped_method.params.as_ref(),
+                        result_val,
+                        last_irreversible_block_number,
+                    );
+                    history_page_ttl(page, fallback_seconds, fixed_seconds)
                 }
+                None => CacheTtl::NoCache,
+            },
+            TtlValue::HonorUpstreamCacheControl => {
+                CacheTtl::NoCache /* TODO: implement this */
             }
-            TtlValue::HonorUpstreamCacheControl => { CacheTtl::NoCache /* TODO: implement this */ }
-            TtlValue::DurationInSeconds(seconds) => { CacheTtl::CacheForDuration(Duration::from_secs(seconds as u64)) }
+            TtlValue::DurationInSeconds(seconds) => {
+                CacheTtl::CacheForDuration(Duration::from_secs(seconds as u64))
+            }
         }
     };
 
@@ -705,7 +786,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         mapped_method.api.as_deref().unwrap_or(""),
         &mapped_method.method,
         &backend.name,
-        backend_duration
+        backend_duration,
     );
 
     let backend_duration_secs = backend_duration;
@@ -720,10 +801,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result_json,
-            backend_duration_secs: Some(backend_duration_secs)
+            backend_duration_secs: Some(backend_duration_secs),
         }),
         size: result_json_len,
-        ttl
+        ttl,
     }
 }
 
@@ -742,6 +823,7 @@ fn record_client_cost(data: &web::Data<AppData>, cost: Option<&RequestCost>, bac
 }
 
 /// Build a JSON access log entry for file logging
+#[allow(clippy::too_many_arguments)] // one flat log record; each argument is one of its fields
 fn build_access_log_json(
     client_ip: &str,
     mapped_method: &MethodAndParams,
@@ -777,26 +859,37 @@ fn build_access_log_json(
     entry
 }
 
-async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId) -> Result<APICallResponse, ErrorStructure> {
+// The error is built at most once per request and immediately rendered, so its size costs nothing
+// worth boxing it for.
+#[allow(clippy::result_large_err)]
+async fn handle_request(
+    request: APIRequest,
+    data: &web::Data<AppData>,
+    client_ip: &String,
+    request_id: &RequestId,
+) -> Result<APICallResponse, ErrorStructure> {
     let request_start = Instant::now();
     data.metrics.inc_active_requests();
 
     // perform any requested mappings, this may give us different method names & and params
-    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| {
-        data.metrics.dec_active_requests();
-        ErrorStructure {
-            jsonrpc: request.jsonrpc.clone(),
-            id : request.id.clone(),
-            error: json!({
-                "code": -32700,
-                "message": "Unable to parse request method.",
-                "error": "Unable to parse request method."
-            }),
-            http_status: StatusCode::NOT_FOUND,
-            tracking_info: None,
-            retry_after: None
-        }
-    })?;
+    let mapped_method =
+        method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(
+            |_| {
+                data.metrics.dec_active_requests();
+                ErrorStructure {
+                    jsonrpc: request.jsonrpc.clone(),
+                    id: request.id.clone(),
+                    error: json!({
+                        "code": -32700,
+                        "message": "Unable to parse request method.",
+                        "error": "Unable to parse request method."
+                    }),
+                    http_status: StatusCode::NOT_FOUND,
+                    tracking_info: None,
+                    retry_after: None,
+                }
+            },
+        )?;
 
     check_for_future_block_requests(&mapped_method, data, request_id).await;
 
@@ -823,29 +916,40 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     // - otherwise, it will call the closure (request_from_upstream()) to get the result,
     //   then insert it into the cache
     //
-    // notes: 
+    // notes:
     // - moka is in charge of this behavior, and it behaves the way we want, but that means
-    //   we have less information about exactly what happened when we call get_with().  
+    //   we have less information about exactly what happened when we call get_with().
     //   We say that the result is "cached" if the closure didn't get executed; that could
     //   mean that the result was already in the cache, or it could mean that another task/thread
     //   was already in the process of requesting it.  That means times for some "cached" calls
     //   could be as long as non-cached calls.  Just something to be aware of.
     // - to get this "combining multiple simultaneous calls" behavior, we're inserting every
     //   result into the cache, even if it's marked as something we don't want to cache in the
-    //   config (we just insert them with a TTL of zero).  That may cause some 
+    //   config (we just insert them with a TTL of zero).  That may cause some
     //   unnecessary/unwanted effects, but so far performance seems to be the same compared to
     //   an alternate implementation where the caching and combining were handled separately.
-    let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
+    let params_str = request
+        .params
+        .as_ref()
+        .map_or("[]".to_string(), |v: &Value| v.to_string());
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
     // `Some` when client cost is accounted
     let client_net = data.config.drone.client_cost_metrics.then(|| Network::of_client(client_ip));
 
-    let admission = data.cost_limiter.as_ref().map_or(Admission::Exempt, |limiter| limiter.admit(client_ip, Instant::now()));
+    let admission = data
+        .cost_limiter
+        .as_ref()
+        .map_or(Admission::Exempt, |limiter| {
+            limiter.admit(client_ip, Instant::now())
+        });
 
     let mut upstream_was_called = false;
     let cache_entry = match admission {
-        Admission::Throttled { network, retry_after } => {
+        Admission::Throttled {
+            network,
+            retry_after,
+        } => {
             // an over-budget network is still served from the cache, since hits cost the backend nothing
             match data.cache.get(&method_and_params_str).await {
                 Some(cache_entry) => cache_entry,
@@ -861,7 +965,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                         &mapped_method.method,
                         COST_LIMIT_ERROR_CODE,
                         false,
-                        request_start.elapsed().as_secs_f64()
+                        request_start.elapsed().as_secs_f64(),
                     );
                     let error = throttled_error(request, &network, retry_after_secs);
                     let cost = client_net.map(|client_net| RequestCost { client_net, response_bytes: error.error.to_string().len() });
@@ -871,17 +975,35 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             }
         }
         Admission::Exempt | Admission::Allowed(_) => {
-            data.cache.get_with_by_ref(&method_and_params_str,
-                                       async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await
+            data.cache
+                .get_with_by_ref(&method_and_params_str, async {
+                    upstream_was_called = true;
+                    request_from_upstream(
+                        data.clone(),
+                        mapped_method.clone(),
+                        method_and_params_str.clone(),
+                        request_id,
+                    )
+                    .await
+                })
+                .await
         }
     };
 
-    if let (Admission::Allowed(network), Some(limiter), true) = (admission, data.cost_limiter.as_ref(), upstream_was_called) {
+    if let (Admission::Allowed(network), Some(limiter), true) =
+        (admission, data.cost_limiter.as_ref(), upstream_was_called)
+    {
         let backend_seconds = match &cache_entry.result {
             Ok(response) => response.backend_duration_secs,
             Err(error) => error.backend_duration_secs,
         };
-        limiter.charge(network, mapped_method.get_method_name_parts(), backend_seconds.unwrap_or(0.0), cache_entry.size as u64, Instant::now());
+        limiter.charge(
+            network,
+            mapped_method.get_method_name_parts(),
+            backend_seconds.unwrap_or(0.0),
+            cache_entry.size as u64,
+            Instant::now(),
+        );
     }
 
     let duration_seconds = request_start.elapsed().as_secs_f64();
@@ -889,7 +1011,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
 
     // Serialize request body early for JSON access logging (before request is moved)
     // Needed for both console JSON logging and file logging
-    let needs_json_logging = data.config.drone.access_log_format == "json" || data.access_log_writer.is_some();
+    let needs_json_logging =
+        data.config.drone.access_log_format == "json" || data.access_log_writer.is_some();
     let request_body_json = if needs_json_logging {
         serde_json::to_string(&request).unwrap_or_default()
     } else {
@@ -908,7 +1031,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 mapped_method.api.as_deref().unwrap_or(""),
                 &mapped_method.method,
                 cached,
-                duration_seconds
+                duration_seconds,
             );
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
@@ -937,7 +1060,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             }
 
             // JSON access log format for console (logs after request processing with full details)
-            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
+            if data.config.drone.access_log_format == "json"
+                && log_enabled!(target: "access_log", Info)
+            {
                 let log_entry = build_access_log_json(
                     client_ip,
                     &mapped_method,
@@ -953,7 +1078,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             }
 
             // Construct tracking_info from mapped_method (not from cache entry)
-            let backend = data.config.lookup_backend(mapped_method.get_method_name_parts());
+            let backend = data
+                .config
+                .lookup_backend(mapped_method.get_method_name_parts());
             let upstream_method = mapped_method.format_for_upstream(&data.config).method;
             let tracking_info = ResponseTrackingInfo {
                 cached,
@@ -975,16 +1102,18 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             let error_http_status = error_data.http_status;
             let response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
-                id : request.id,
+                id: request.id,
                 error: error_data.error.clone(),
                 http_status: error_http_status,
                 tracking_info: None,
-                retry_after: None
+                retry_after: None,
             };
             let cached = !upstream_was_called;
 
             // Record error metrics - extract error code from JSON error object
-            let error_code = error_data.error.get("code")
+            let error_code = error_data
+                .error
+                .get("code")
                 .and_then(|c| c.as_i64())
                 .unwrap_or(-32000) as i32;
             data.metrics.record_request_error(
@@ -993,7 +1122,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 &mapped_method.method,
                 error_code,
                 cached,
-                duration_seconds
+                duration_seconds,
             );
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
@@ -1023,7 +1152,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             }
 
             // JSON access log format for console (logs after request processing with full details)
-            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
+            if data.config.drone.access_log_format == "json"
+                && log_enabled!(target: "access_log", Info)
+            {
                 let log_entry = build_access_log_json(
                     client_ip,
                     &mapped_method,
@@ -1056,7 +1187,7 @@ fn throttled_error(request: APIRequest, network: &str, retry_after_secs: u64) ->
         }),
         http_status: StatusCode::TOO_MANY_REQUESTS,
         tracking_info: None,
-        retry_after: Some(retry_after_secs)
+        retry_after: Some(retry_after_secs),
     }
 }
 
@@ -1092,7 +1223,7 @@ async fn api_call(
     req: HttpRequest,
     call: web::Json<APICall>,
     data: web::Data<AppData>,
-    request_id: RequestId
+    request_id: RequestId,
 ) -> impl Responder {
     let user_ip = match resolve_client_ip(&req, data.config.drone.trust_forwarded_for) {
         Some(ip) => ip,
@@ -1122,11 +1253,11 @@ async fn api_call(
                         }
                     }
                     let id_json = serde_json::to_string(&response.id).unwrap();
-                    reply_builder
-                        .content_type("application/json")
-                        .body(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
-                            response.jsonrpc, response.result_json, id_json))
-                },
+                    reply_builder.content_type("application/json").body(format!(
+                        r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                        response.jsonrpc, response.result_json, id_json
+                    ))
+                }
                 Err(err) => {
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
                     let mut reply_builder = HttpResponse::build(err.http_status);
@@ -1169,19 +1300,23 @@ async fn api_call(
                 let result = handle_request(request, &data, &user_ip, &request_id).await;
                 match result {
                     Ok(response) => {
-                        if !response.tracking_info.map_or(false, |v| v.cached) {
+                        if !response.tracking_info.is_some_and(|v| v.cached) {
                             cached = false;
                         }
                         let id_json = serde_json::to_string(&response.id).unwrap();
-                        responses.push(format!(r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
-                            response.jsonrpc, response.result_json, id_json));
-                    },
+                        responses.push(format!(
+                            r#"{{"jsonrpc":"{}","result":{},"id":{}}}"#,
+                            response.jsonrpc, response.result_json, id_json
+                        ));
+                    }
                     Err(err) => {
                         retry_after = retry_after.max(err.retry_after);
                         let id_json = serde_json::to_string(&err.id).unwrap();
                         let error_json = serde_json::to_string(&err.error).unwrap();
-                        responses.push(format!(r#"{{"jsonrpc":"{}","id":{},"error":{}}}"#,
-                            err.jsonrpc, id_json, error_json));
+                        responses.push(format!(
+                            r#"{{"jsonrpc":"{}","id":{},"error":{}}}"#,
+                            err.jsonrpc, id_json, error_json
+                        ));
                     }
                 }
             }
@@ -1193,9 +1328,7 @@ async fn api_call(
             if let Some(retry_after) = retry_after {
                 reply_builder.insert_header(("Retry-After", retry_after.to_string()));
             }
-            reply_builder
-                .content_type("application/json")
-                .body(body)
+            reply_builder.content_type("application/json").body(body)
         }
     }
 }
@@ -1218,9 +1351,7 @@ fn build_cache(max_capacity: u64) -> Cache<String, CacheEntry> {
     let eviction_listener = |key, _value, cause| {
         debug!("Evicted key {key}. Cause: {cause:?}");
     };
-    let weigher = |_key: &String, value: &CacheEntry| -> u32 {
-        value.size
-    };
+    let weigher = |_key: &String, value: &CacheEntry| -> u32 { value.size };
 
     Cache::builder()
         .max_capacity(max_capacity)
@@ -1273,11 +1404,17 @@ async fn main() -> std::io::Result<()> {
             let mut interval = tokio::time::interval(Duration::from_secs(15));
             loop {
                 interval.tick().await;
-                let ratios: Vec<(String, &str, f64)> = limiter_for_task.usage_ratios(Instant::now()).into_iter()
+                let ratios: Vec<(String, &str, f64)> = limiter_for_task
+                    .usage_ratios(Instant::now())
+                    .into_iter()
                     .filter(|usage| usage.ratio >= COST_LIMIT_GAUGE_MIN_RATIO)
                     .map(|usage| (usage.network.to_string(), usage.resource, usage.ratio))
                     .collect();
-                metrics_for_task.update_cost_limit_usage(ratios.iter().map(|(network, resource, ratio)| (network.as_str(), *resource, *ratio)));
+                metrics_for_task.update_cost_limit_usage(
+                    ratios
+                        .iter()
+                        .map(|(network, resource, ratio)| (network.as_str(), *resource, *ratio)),
+                );
             }
         });
     }
@@ -1291,9 +1428,20 @@ async fn main() -> std::io::Result<()> {
             .create(true)
             .append(true)
             .open(&app_config.drone.access_log_file)
-            .unwrap_or_else(|e| panic!("Failed to open access log file '{}': {}", app_config.drone.access_log_file, e));
-        info!("Access log file enabled: {}", app_config.drone.access_log_file);
-        Some(Arc::new(Mutex::new(BufWriter::with_capacity(ACCESS_LOG_BUFFER_SIZE, file))))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to open access log file '{}': {}",
+                    app_config.drone.access_log_file, e
+                )
+            });
+        info!(
+            "Access log file enabled: {}",
+            app_config.drone.access_log_file
+        );
+        Some(Arc::new(Mutex::new(BufWriter::with_capacity(
+            ACCESS_LOG_BUFFER_SIZE,
+            file,
+        ))))
     } else {
         None
     };
@@ -1346,7 +1494,10 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let mut app = App::new()
             .wrap(RequestIdentifier::with_uuid().use_incoming_id(IdReuse::UseIncoming))
-            .wrap(Condition::new(app_config.drone.add_cors_headers, Cors::permissive()))
+            .wrap(Condition::new(
+                app_config.drone.add_cors_headers,
+                Cors::permissive(),
+            ))
             .app_data(
                 web::JsonConfig::default()
                     .content_type(|_| true)
@@ -1367,7 +1518,10 @@ async fn main() -> std::io::Result<()> {
 
         #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
         if debug_endpoints_enabled {
-            app = app.route("/debug/jemalloc_stats", web::get().to(jemalloc_stats_handler));
+            app = app.route(
+                "/debug/jemalloc_stats",
+                web::get().to(jemalloc_stats_handler),
+            );
             app = app.route("/debug/heap_profile", web::get().to(heap_profile_handler));
         }
 
@@ -1380,7 +1534,11 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, metrics_handler, resolve_client_ip, AppData, BlockchainState, CacheTtl, ClientCostTracker, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
+    use super::{
+        api_call, build_cache, config, history_page_ttl, is_block_result_empty, metrics_handler,
+        resolve_client_ip, AppData, BlockchainState, CacheTtl, ClientCostTracker, CostLimiter,
+        DroneMetrics, HistoryPage, UpstreamJsonRpcResponse,
+    };
     use actix_request_identifier::RequestIdentifier;
     use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
     use serde_json::{json, Value};
@@ -1414,31 +1572,56 @@ mod tests {
     #[test]
     fn get_block_with_a_block_is_not_empty() {
         let block_id = "04c9b5a0e1a6c1f0e7b5d3c2a1f0e9d8c7b6a5f4";
-        assert!(!is_block_result_empty("get_block", &json!({"block": {"block_id": block_id}})));
-        assert!(!is_block_result_empty("get_block_header", &json!({"header": {"previous": block_id}})));
-        assert!(!is_block_result_empty("get_block", &json!({"block_id": block_id, "transactions": []})));
-        assert!(!is_block_result_empty("get_block_header", &json!({"previous": block_id})));
+        assert!(!is_block_result_empty(
+            "get_block",
+            &json!({"block": {"block_id": block_id}})
+        ));
+        assert!(!is_block_result_empty(
+            "get_block_header",
+            &json!({"header": {"previous": block_id}})
+        ));
+        assert!(!is_block_result_empty(
+            "get_block",
+            &json!({"block_id": block_id, "transactions": []})
+        ));
+        assert!(!is_block_result_empty(
+            "get_block_header",
+            &json!({"previous": block_id})
+        ));
     }
 
     #[test]
     fn other_methods_are_never_treated_as_empty_blocks() {
         // a misconfigured EXPIRE_IF_REVERSIBLE method must still reach the ERROR path
         assert!(!is_block_result_empty("get_accounts", &json!({})));
-        assert!(!is_block_result_empty("get_dynamic_global_properties", &json!({"head_block_number": 1})));
+        assert!(!is_block_result_empty(
+            "get_dynamic_global_properties",
+            &json!({"head_block_number": 1})
+        ));
     }
 
     #[test]
     fn fixed_history_page_is_cached_for_fixed_seconds_not_forever() {
-        let ttl = expiry(history_page_ttl(HistoryPage::Fixed, 6, 3600)).expect("fixed pages must not be cached forever");
+        let ttl = expiry(history_page_ttl(HistoryPage::Fixed, 6, 3600))
+            .expect("fixed pages must not be cached forever");
         assert!(ttl > Duration::from_secs(12));
         assert_eq!(ttl, Duration::from_secs(3600));
-        assert_eq!(expiry(history_page_ttl(HistoryPage::Fixed, 6, 600)), Some(Duration::from_secs(600)));
+        assert_eq!(
+            expiry(history_page_ttl(HistoryPage::Fixed, 6, 600)),
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]
     fn mutable_and_empty_history_pages_ignore_fixed_seconds() {
-        assert_eq!(expiry(history_page_ttl(HistoryPage::Mutable, 6, 600)), Some(Duration::from_secs(6)));
-        assert_eq!(expiry(history_page_ttl(HistoryPage::Empty, 6, 600)), Some(Duration::ZERO));
+        assert_eq!(
+            expiry(history_page_ttl(HistoryPage::Mutable, 6, 600)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(
+            expiry(history_page_ttl(HistoryPage::Empty, 6, 600)),
+            Some(Duration::ZERO)
+        );
     }
 
     // The issue #1 fix relies on `Option<Option<Box<RawValue>>>` + `#[serde(default)]`
@@ -1457,9 +1640,10 @@ mod tests {
         assert!(matches!(n.result, Some(None)));
 
         // Non-JSON-RPC error body (no result, no error keys) -> None (the masked-error case)
-        let e: UpstreamJsonRpcResponse =
-            serde_json::from_str(r#"{"code":"57014","message":"canceling statement due to statement timeout"}"#)
-                .unwrap();
+        let e: UpstreamJsonRpcResponse = serde_json::from_str(
+            r#"{"code":"57014","message":"canceling statement due to statement timeout"}"#,
+        )
+        .unwrap();
         assert!(e.result.is_none());
         assert!(e.error.is_none());
     }
@@ -1467,15 +1651,28 @@ mod tests {
     #[test]
     fn client_ip_comes_from_x_forwarded_for_only_when_trusted() {
         let peer = "10.0.0.1:5000".parse().unwrap();
-        let forwarded = actix_test::TestRequest::default().peer_addr(peer)
-            .insert_header(("X-Forwarded-For", "203.0.113.7, 10.0.0.1")).to_http_request();
-        assert_eq!(resolve_client_ip(&forwarded, true).as_deref(), Some("203.0.113.7"));
-        assert_eq!(resolve_client_ip(&forwarded, false).as_deref(), Some("10.0.0.1"));
+        let forwarded = actix_test::TestRequest::default()
+            .peer_addr(peer)
+            .insert_header(("X-Forwarded-For", "203.0.113.7, 10.0.0.1"))
+            .to_http_request();
+        assert_eq!(
+            resolve_client_ip(&forwarded, true).as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            resolve_client_ip(&forwarded, false).as_deref(),
+            Some("10.0.0.1")
+        );
 
-        let cloudflare = actix_test::TestRequest::default().peer_addr(peer)
+        let cloudflare = actix_test::TestRequest::default()
+            .peer_addr(peer)
             .insert_header(("CF-Connecting-IP", "198.51.100.4"))
-            .insert_header(("X-Forwarded-For", "203.0.113.7")).to_http_request();
-        assert_eq!(resolve_client_ip(&cloudflare, true).as_deref(), Some("198.51.100.4"));
+            .insert_header(("X-Forwarded-For", "203.0.113.7"))
+            .to_http_request();
+        assert_eq!(
+            resolve_client_ip(&cloudflare, true).as_deref(),
+            Some("198.51.100.4")
+        );
     }
 
     const BACKEND_RESULT_BYTES: usize = 1000;
@@ -1492,18 +1689,26 @@ mod tests {
         let calls_for_server = calls.clone();
         let server = HttpServer::new(move || {
             let calls = calls_for_server.clone();
-            App::new().route("/", web::post().to(move || {
-                let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    actix_web::rt::time::sleep(delay).await;
-                    HttpResponse::Ok().content_type("application/json")
-                        .body(format!(r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#, "x".repeat(BACKEND_RESULT_BYTES)))
-                }
-            }))
+            App::new().route(
+                "/",
+                web::post().to(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        actix_web::rt::time::sleep(delay).await;
+                        HttpResponse::Ok()
+                            .content_type("application/json")
+                            .body(format!(
+                                r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#,
+                                "x".repeat(BACKEND_RESULT_BYTES)
+                            ))
+                    }
+                }),
+            )
         })
         .workers(1)
-        .bind(("127.0.0.1", 0)).unwrap();
+        .bind(("127.0.0.1", 0))
+        .unwrap();
         let url = format!("http://{}", server.addrs()[0]);
         actix_web::rt::spawn(server.run());
         (url, calls)
@@ -1517,7 +1722,11 @@ mod tests {
     fn app_data_with(backend_url: &str, cost_limit_yaml: &str, drone_yaml: &str) -> AppData {
         let drone_yaml = if drone_yaml.is_empty() { String::new() } else { format!(", {drone_yaml}") };
         static CONFIG_FILES: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!("drone-cost-limit-test-{}-{}.yaml", std::process::id(), CONFIG_FILES.fetch_add(1, Ordering::SeqCst)));
+        let path = std::env::temp_dir().join(format!(
+            "drone-cost-limit-test-{}-{}.yaml",
+            std::process::id(),
+            CONFIG_FILES.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::write(&path, format!(r#"
 drone: {{port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true{drone_yaml}}}
 backends: {{hived: "{backend_url}"}}
@@ -1533,7 +1742,9 @@ cost_limit: {cost_limit_yaml}
         AppData {
             cache: build_cache(app_config.drone.cache_max_capacity),
             webclient: reqwest::Client::new(),
-            cost_limiter: CostLimiter::from_config(&app_config.cost_limit).unwrap().map(Arc::new),
+            cost_limiter: CostLimiter::from_config(&app_config.cost_limit)
+                .unwrap()
+                .map(Arc::new),
             client_costs: ClientCostTracker::from_config(&app_config.drone).unwrap(),
             config: app_config,
             blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
@@ -1544,7 +1755,8 @@ cost_limit: {cost_limit_yaml}
     }
 
     fn call(client_ip: &str, body: Value) -> actix_test::TestRequest {
-        actix_test::TestRequest::post().uri("/")
+        actix_test::TestRequest::post()
+            .uri("/")
             .peer_addr("10.0.0.1:5000".parse().unwrap())
             .insert_header(("X-Forwarded-For", client_ip))
             .set_json(body)
@@ -1558,22 +1770,39 @@ cost_limit: {cost_limit_yaml}
     async fn network_over_its_byte_budget_gets_429_for_misses_but_keeps_its_cache_hits() {
         let (backend_url, backend_calls) = start_backend();
         // two misses (about 2 x 1000 bytes) exceed the budget
-        let data = web::Data::new(app_data(&backend_url, "{enabled: true, window_seconds: 60, response_bytes: 1500, allowlist: [192.0.2.0/24]}"));
-        let app = actix_test::init_service(App::new()
-            .wrap(RequestIdentifier::with_uuid())
-            .app_data(data.clone())
-            .route("/", web::post().to(api_call))).await;
+        let data = web::Data::new(app_data(
+            &backend_url,
+            "{enabled: true, window_seconds: 60, response_bytes: 1500, allowlist: [192.0.2.0/24]}",
+        ));
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(RequestIdentifier::with_uuid())
+                .app_data(data.clone())
+                .route("/", web::post().to(api_call)),
+        )
+        .await;
 
         for (client_ip, account) in [("203.0.113.7", "a"), ("203.0.113.8", "b")] {
-            let response = actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request()).await;
+            let response =
+                actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request())
+                    .await;
             assert_eq!(response.status(), 200);
         }
         assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
 
         // another address of the same /24: refused without calling the backend
-        let response = actix_test::call_service(&app, call("203.0.113.9", get_accounts("c")).to_request()).await;
+        let response =
+            actix_test::call_service(&app, call("203.0.113.9", get_accounts("c")).to_request())
+                .await;
         assert_eq!(response.status(), 429);
-        let retry_after: u64 = response.headers().get("Retry-After").unwrap().to_str().unwrap().parse().unwrap();
+        let retry_after: u64 = response
+            .headers()
+            .get("Retry-After")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!((1..=60).contains(&retry_after), "Retry-After {retry_after}");
         let body: Value = actix_test::read_body_json(response).await;
         assert_eq!(body["error"]["code"], -32029);
@@ -1581,30 +1810,47 @@ cost_limit: {cost_limit_yaml}
         assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
 
         // its cache hits are still served
-        let response = actix_test::call_service(&app, call("203.0.113.9", get_accounts("a")).to_request()).await;
+        let response =
+            actix_test::call_service(&app, call("203.0.113.9", get_accounts("a")).to_request())
+                .await;
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers().get("X-Jussi-Cache-Hit").unwrap(), "true");
 
         // in a batch, the misses get the error and the hits their result
         let batch = json!([get_accounts("a"), get_accounts("f")]);
-        let response = actix_test::call_service(&app, call("203.0.113.9", batch).to_request()).await;
+        let response =
+            actix_test::call_service(&app, call("203.0.113.9", batch).to_request()).await;
         assert_eq!(response.status(), 200);
         assert!(response.headers().contains_key("Retry-After"));
         let body: Value = actix_test::read_body_json(response).await;
-        assert_eq!(body[0]["result"].as_str().map(str::len), Some(BACKEND_RESULT_BYTES));
+        assert_eq!(
+            body[0]["result"].as_str().map(str::len),
+            Some(BACKEND_RESULT_BYTES)
+        );
         assert_eq!(body[1]["error"]["code"], -32029);
         assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
 
         // other networks and allowlisted ones are unaffected
-        for (client_ip, account) in [("203.0.114.9", "d"), ("192.0.2.5", "e"), ("192.0.2.5", "g"), ("192.0.2.5", "h")] {
-            let response = actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request()).await;
+        for (client_ip, account) in [
+            ("203.0.114.9", "d"),
+            ("192.0.2.5", "e"),
+            ("192.0.2.5", "g"),
+            ("192.0.2.5", "h"),
+        ] {
+            let response =
+                actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request())
+                    .await;
             assert_eq!(response.status(), 200, "{client_ip}");
             assert!(!response.headers().contains_key("Retry-After"));
         }
         assert_eq!(backend_calls.load(Ordering::SeqCst), 6);
 
         let metrics = data.metrics.encode();
-        assert!(metrics.contains(r#"drone_test_cost_limit_throttled_total{network="203.0.113.0/24"} 2"#), "{metrics}");
+        assert!(
+            metrics
+                .contains(r#"drone_test_cost_limit_throttled_total{network="203.0.113.0/24"} 2"#),
+            "{metrics}"
+        );
     }
 
     #[actix_web::test]
@@ -1612,12 +1858,19 @@ cost_limit: {cost_limit_yaml}
         let (backend_url, backend_calls) = start_backend();
         let data = web::Data::new(app_data(&backend_url, "{response_bytes: 1}"));
         assert!(data.cost_limiter.is_none());
-        let app = actix_test::init_service(App::new()
-            .wrap(RequestIdentifier::with_uuid())
-            .app_data(data)
-            .route("/", web::post().to(api_call))).await;
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(RequestIdentifier::with_uuid())
+                .app_data(data)
+                .route("/", web::post().to(api_call)),
+        )
+        .await;
         for account in ["a", "b", "c"] {
-            let response = actix_test::call_service(&app, call("203.0.113.7", get_accounts(account)).to_request()).await;
+            let response = actix_test::call_service(
+                &app,
+                call("203.0.113.7", get_accounts(account)).to_request(),
+            )
+            .await;
             assert_eq!(response.status(), 200);
         }
         assert_eq!(backend_calls.load(Ordering::SeqCst), 3);

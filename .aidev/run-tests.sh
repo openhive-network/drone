@@ -7,16 +7,21 @@
 #   .aidev/run-tests.sh            # the tests
 #   .aidev/run-tests.sh --release  # also `cargo check --release`: the release
 #                                  # build is what the Dockerfile/CI ship
+#   .aidev/run-tests.sh --coverage # the tests under cargo-llvm-cov, writing a
+#                                  # Cobertura coverage.xml to the artefacts dir
 #
-# Runs outside the image too, given cargo and cargo-nextest.
+# Any further arguments go to `cargo nextest run` (e.g. a test name filter).
+#
+# Runs outside the image too, given cargo and cargo-nextest (and cargo-llvm-cov
+# for --coverage).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-release_check=false
-if [ "${1:-}" = "--release" ]; then
-    release_check=true
-fi
+mode=""
+case "${1:-}" in
+    --release | --coverage) mode="$1"; shift ;;
+esac
 
 # Last-run-wins: a report left by an earlier run must not be read as this one's.
 rm -rf test-results
@@ -24,8 +29,21 @@ rm -rf test-results
 # `< /dev/null`: the suite otherwise inherits the pipe AIDEV feeds its script
 # through (aidev#13728). The junit report lands in
 # test-results/nextest/aidev/junit.xml (.config/nextest.toml).
-cargo nextest run --locked --profile aidev < /dev/null
-
-if $release_check; then
-    cargo check --locked --release < /dev/null
-fi
+case "$mode" in
+    "")
+        cargo nextest run --locked --profile aidev "$@" < /dev/null
+        ;;
+    --release)
+        cargo nextest run --locked --profile aidev "$@" < /dev/null
+        cargo check --locked --release < /dev/null
+        ;;
+    --coverage)
+        # AIDEV reads the report from coverage.xml in AIDEV_SUITE_ARTIFACTS
+        # (.aidev-artifacts/ in the workspace when it is not set).
+        artifacts="${AIDEV_SUITE_ARTIFACTS:-.aidev-artifacts}"
+        mkdir -p "$artifacts"
+        rm -f "$artifacts/coverage.xml"
+        cargo llvm-cov nextest --locked --profile aidev \
+            --cobertura --output-path "$artifacts/coverage.xml" "$@" < /dev/null
+        ;;
+esac

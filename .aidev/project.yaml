@@ -29,11 +29,12 @@ branches:
 # carries the Rust toolchain (rust:bullseye, as the project's Dockerfile),
 # cargo-nextest and Cargo.lock's dependencies precompiled, because AIDEV runs it
 # with no network (.aidev/runtime/Dockerfile). It moves with Cargo.lock:
-# rebuild and re-pin with .aidev/runtime/build.sh.
+# rebuild and re-pin with .aidev/runtime/build.sh. The Dockerfile is an input
+# too, so a repin for a Dockerfile change is admitted as a paired bump.
 environment:
   kind: "container"
   image: "registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:f9e736b46d48f71f85cb5c7b5063223a5c797c55f8744ecafa0166dda0915dd0"
-  inputs: ["Cargo.lock"]
+  inputs: ["Cargo.lock", ".aidev/runtime/Dockerfile"]
 
 issues:
   intake_label: todo
