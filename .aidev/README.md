@@ -32,13 +32,11 @@ branches; `aidev/integration` and everything else run as before.
   (and cargo-llvm-cov for `--coverage`) are installed.
 - `.aidev/run-static-checks.sh` runs `cargo fmt --check` and
   `cargo clippy --all-targets -- -D warnings`; either failing fails it.
-- The pinned image does not carry rustfmt, clippy or cargo-llvm-cov yet, so
-  `static` is unbound and `coverage` runs the plain tests until it is rebuilt
-  with them.
-- The platform runs the script inside
+- The platform runs the scripts inside
   `registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:…` with no network, so the
-  image carries the toolchain and `Cargo.lock`'s dependencies. After changing
-  `Cargo.lock` or `.aidev/runtime/Dockerfile`, run `.aidev/runtime/build.sh` (after
+  image carries the toolchain (with rustfmt and clippy), cargo-nextest, cargo-llvm-cov
+  and `Cargo.lock`'s dependencies. After changing `Cargo.lock` or
+  `.aidev/runtime/Dockerfile`, run `.aidev/runtime/build.sh` (after
   `docker login registry.gitlab.syncad.com`) and put the digest it prints into
   `environment.image` in `project.yaml`.
 
@@ -50,4 +48,5 @@ Declared in `.aidev/project.yaml` under `verification`:
 - `full` — `command` .aidev/run-tests.sh --release
 - `baseline` — `command` .aidev/run-tests.sh
 - `canary` — `command` .aidev/run-tests.sh --release
-- `coverage` — `command` .aidev/run-tests.sh
+- `coverage` — `command` .aidev/run-tests.sh --coverage
+- `static` — `command` .aidev/run-static-checks.sh
