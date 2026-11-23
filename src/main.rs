@@ -659,7 +659,7 @@ async fn request_from_upstream(
     upstream_id: ID,
     stream_above: Option<u64>,
     request_id: &RequestId,
-) -> Result<CacheEntry, UpstreamStream> {
+) -> Result<CacheEntry, Box<UpstreamStream>> {
     let backend_start = Instant::now();
     let (res, backend) = match send_to_upstream(
         &data,
@@ -677,11 +677,11 @@ async fn request_from_upstream(
     if let (Some(limit), Some(length)) = (stream_above, res.content_length()) {
         if length > limit {
             debug!(request_id=request_id.as_str(); "{method_and_params_str}: response of {length} bytes is over stream_min_bytes, streaming it uncached");
-            return Err(UpstreamStream {
+            return Err(Box::new(UpstreamStream {
                 response: res,
                 backend_name: backend.name.clone(),
                 started: backend_start,
-            });
+            }));
         }
     }
     Ok(buffer_upstream_response(
@@ -1456,7 +1456,7 @@ async fn handle_request(
                     )
                     .await
                     .map_err(|upstream| {
-                        oversized = Some(upstream);
+                        oversized = Some(*upstream);
                         StreamedInstead
                     })
                 })

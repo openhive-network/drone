@@ -26,14 +26,15 @@ branches:
   handoff_history: "linear"
 
 # How this project's suites execute (#13892): one kind, stated once. The image
-# carries the Rust toolchain (rust:bullseye, as the project's Dockerfile),
-# cargo-nextest and Cargo.lock's dependencies precompiled, because AIDEV runs it
-# with no network (.aidev/runtime/Dockerfile). It moves with Cargo.lock:
-# rebuild and re-pin with .aidev/runtime/build.sh. The Dockerfile is an input
-# too, so a repin for a Dockerfile change is admitted as a paired bump.
+# carries the Rust toolchain (rust:bullseye, as the project's Dockerfile) with
+# clippy and rustfmt, cargo-nextest, cargo-llvm-cov and Cargo.lock's
+# dependencies precompiled, because AIDEV runs it with no network
+# (.aidev/runtime/Dockerfile). It moves with Cargo.lock: rebuild and re-pin
+# with .aidev/runtime/build.sh. The Dockerfile is an input too, so a repin for
+# a Dockerfile change is admitted as a paired bump.
 environment:
   kind: "container"
-  image: "registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:f9e736b46d48f71f85cb5c7b5063223a5c797c55f8744ecafa0166dda0915dd0"
+  image: "registry.gitlab.syncad.com/hive/drone/aidev-tests@sha256:91bfa8819541040d1ddd406c8e303995ff8bf97df3c2b6e40d3b733f2a0c700e"
   inputs: ["Cargo.lock", ".aidev/runtime/Dockerfile"]
 
 issues:
@@ -53,9 +54,10 @@ issues:
 #
 # One suite (the cargo tests; junit via cargo-nextest into test-results/).
 # full and canary add `cargo check --release` (the build the image ships).
-# `coverage` runs the same tests (the coverage-improve phase needs a binding;
-# there is no coverage tool in the image yet). static and system are unbound:
-# drone has no linter run or system suite yet.
+# `coverage` runs the same tests under cargo-llvm-cov and writes the Cobertura
+# coverage.xml AIDEV reads from the artefacts directory. `static` is
+# `cargo fmt --check` plus `cargo clippy --all-targets -- -D warnings`
+# (.aidev/run-static-checks.sh). system is unbound: drone has no system suite.
 verification:
   quick:
     adapter: command
@@ -75,8 +77,11 @@ verification:
     artifacts: ["test-results/"]
   coverage:
     adapter: command
-    args: [".aidev/run-tests.sh"]
+    args: [".aidev/run-tests.sh", "--coverage"]
     artifacts: ["test-results/"]
+  static:
+    adapter: command
+    args: [".aidev/run-static-checks.sh"]
 
 # Capability grants for target-side code. Empty until this project needs one.
 capabilities: []
