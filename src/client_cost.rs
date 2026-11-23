@@ -73,22 +73,45 @@ impl ClientCostTracker {
         if config.client_cost_window_seconds == 0 {
             return Err("drone.client_cost_window_seconds must be greater than 0".to_string());
         }
-        Ok(Some(ClientCostTracker::new(config.client_cost_top_networks, Duration::from_secs(config.client_cost_window_seconds))))
+        Ok(Some(ClientCostTracker::new(
+            config.client_cost_top_networks,
+            Duration::from_secs(config.client_cost_window_seconds),
+        )))
     }
 
     fn new(top_networks: usize, window: Duration) -> ClientCostTracker {
-        ClientCostTracker { top_networks, window, state: Mutex::new(State::default()) }
+        ClientCostTracker {
+            top_networks,
+            window,
+            state: Mutex::new(State::default()),
+        }
     }
 
     /// Charges one request to `network` (`None`: the client address did not parse)
-    pub fn record(&self, network: Option<Network>, backend_seconds: f64, response_bytes: u64, now: Instant) {
-        let cost = Totals { backend_seconds, response_bytes, requests: 1 };
+    pub fn record(
+        &self,
+        network: Option<Network>,
+        backend_seconds: f64,
+        response_bytes: u64,
+        now: Instant,
+    ) {
+        let cost = Totals {
+            backend_seconds,
+            response_bytes,
+            requests: 1,
+        };
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state;
         let tracked = match network {
-            Some(network) if state.networks.len() < MAX_TRACKED_NETWORKS || state.networks.contains_key(&network) => {
-                state.networks.entry(network)
-                    .or_insert_with(|| Tracked { totals: Totals::default(), recent_backend_seconds: 0.0, updated: now })
+            Some(network)
+                if state.networks.len() < MAX_TRACKED_NETWORKS
+                    || state.networks.contains_key(&network) =>
+            {
+                state.networks.entry(network).or_insert_with(|| Tracked {
+                    totals: Totals::default(),
+                    recent_backend_seconds: 0.0,
+                    updated: now,
+                })
             }
             _ => {
                 state.untracked.add(&cost);
@@ -106,7 +129,9 @@ impl ClientCostTracker {
     pub fn top(&self, now: Instant) -> TopNetworks {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state;
-        let mut ranked: Vec<(Network, f64)> = state.networks.iter()
+        let mut ranked: Vec<(Network, f64)> = state
+            .networks
+            .iter()
             .map(|(network, tracked)| (*network, self.decayed(tracked, now)))
             .filter(|(_, recent)| *recent > 0.0)
             .collect();
@@ -128,7 +153,10 @@ impl ClientCostTracker {
         });
         state.untracked.add(&forgotten);
 
-        let networks = ranked.iter().map(|(network, _)| (*network, state.networks[network].totals)).collect();
+        let networks = ranked
+            .iter()
+            .map(|(network, _)| (*network, state.networks[network].totals))
+            .collect();
         TopNetworks { networks, other }
     }
 
@@ -149,7 +177,12 @@ mod tests {
     }
 
     fn labels(tracker: &ClientCostTracker, now: Instant) -> Vec<String> {
-        tracker.top(now).networks.iter().map(|(network, _)| network.to_string()).collect()
+        tracker
+            .top(now)
+            .networks
+            .iter()
+            .map(|(network, _)| network.to_string())
+            .collect()
     }
 
     #[test]
@@ -164,10 +197,37 @@ mod tests {
         tracker.record(None, 0.5, 1, now);
 
         let top = tracker.top(now);
-        assert_eq!(top.networks.iter().map(|(network, _)| network.to_string()).collect::<Vec<_>>(), ["203.0.113.0/24", "198.51.100.0/24"]);
-        assert_eq!(top.networks[0].1, Totals { backend_seconds: 5.0, response_bytes: 1500, requests: 2 });
-        assert_eq!(top.networks[1].1, Totals { backend_seconds: 4.0, response_bytes: 10, requests: 1 });
-        assert_eq!(top.other, Totals { backend_seconds: 1.5, response_bytes: 107, requests: 3 });
+        assert_eq!(
+            top.networks
+                .iter()
+                .map(|(network, _)| network.to_string())
+                .collect::<Vec<_>>(),
+            ["203.0.113.0/24", "198.51.100.0/24"]
+        );
+        assert_eq!(
+            top.networks[0].1,
+            Totals {
+                backend_seconds: 5.0,
+                response_bytes: 1500,
+                requests: 2
+            }
+        );
+        assert_eq!(
+            top.networks[1].1,
+            Totals {
+                backend_seconds: 4.0,
+                response_bytes: 10,
+                requests: 1
+            }
+        );
+        assert_eq!(
+            top.other,
+            Totals {
+                backend_seconds: 1.5,
+                response_bytes: 107,
+                requests: 3
+            }
+        );
     }
 
     #[test]
@@ -182,12 +242,26 @@ mod tests {
         tracker.record(net("198.51.100.1"), 1.0, 10, later);
         let top = tracker.top(later);
         assert_eq!(labels(&tracker, later), ["198.51.100.0/24"]);
-        assert_eq!(top.other, Totals { backend_seconds: 10.0, response_bytes: 100, requests: 1 });
+        assert_eq!(
+            top.other,
+            Totals {
+                backend_seconds: 10.0,
+                response_bytes: 100,
+                requests: 1
+            }
+        );
 
         // the forgotten network's totals stay in other, and it restarts from zero when it returns
         tracker.record(net("203.0.113.1"), 0.5, 1, later);
         let top = tracker.top(later);
-        assert_eq!(top.other, Totals { backend_seconds: 10.5, response_bytes: 101, requests: 2 });
+        assert_eq!(
+            top.other,
+            Totals {
+                backend_seconds: 10.5,
+                response_bytes: 101,
+                requests: 2
+            }
+        );
     }
 
     #[test]
@@ -195,23 +269,51 @@ mod tests {
         let tracker = ClientCostTracker::new(20, Duration::from_secs(300));
         let now = Instant::now();
         for i in 0..200u32 {
-            tracker.record(net(&format!("10.{}.{}.1", i / 256, i % 256)), f64::from(i + 1), 1, now);
+            tracker.record(
+                net(&format!("10.{}.{}.1", i / 256, i % 256)),
+                f64::from(i + 1),
+                1,
+                now,
+            );
         }
         let top = tracker.top(now);
         assert_eq!(top.networks.len(), 20);
         assert_eq!(top.networks[0].0.to_string(), "10.0.199.0/24");
         assert_eq!(top.networks[19].0.to_string(), "10.0.180.0/24");
-        let exported_requests: u64 = top.networks.iter().map(|(_, totals)| totals.requests).sum::<u64>() + top.other.requests;
+        let exported_requests: u64 = top
+            .networks
+            .iter()
+            .map(|(_, totals)| totals.requests)
+            .sum::<u64>()
+            + top.other.requests;
         assert_eq!(exported_requests, 200);
     }
 
     #[test]
     fn config_switch_and_validation() {
-        let config = |yaml: &str| serde_yaml::from_str::<crate::config::DroneConfig>(&format!(
-            "{{port: 0, hostname: h, cache_max_capacity: 1, operator_message: m, middleware_connection_threads: 1, {yaml}}}")).unwrap();
-        assert!(ClientCostTracker::from_config(&config("metrics_enabled: true")).unwrap().is_some(), "on by default");
-        assert!(ClientCostTracker::from_config(&config("metrics_enabled: true, client_cost_metrics: false")).unwrap().is_none());
-        assert!(ClientCostTracker::from_config(&config("metrics_enabled: false")).unwrap().is_none());
-        assert!(ClientCostTracker::from_config(&config("metrics_enabled: true, client_cost_window_seconds: 0")).is_err());
+        let config = |yaml: &str| {
+            serde_yaml::from_str::<crate::config::DroneConfig>(&format!(
+            "{{port: 0, hostname: h, cache_max_capacity: 1, operator_message: m, middleware_connection_threads: 1, {yaml}}}")).unwrap()
+        };
+        assert!(
+            ClientCostTracker::from_config(&config("metrics_enabled: true"))
+                .unwrap()
+                .is_some(),
+            "on by default"
+        );
+        assert!(ClientCostTracker::from_config(&config(
+            "metrics_enabled: true, client_cost_metrics: false"
+        ))
+        .unwrap()
+        .is_none());
+        assert!(
+            ClientCostTracker::from_config(&config("metrics_enabled: false"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ClientCostTracker::from_config(&config(
+            "metrics_enabled: true, client_cost_window_seconds: 0"
+        ))
+        .is_err());
     }
 }
