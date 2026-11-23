@@ -8,8 +8,12 @@ pub struct Network(IpAddr);
 impl Network {
     pub fn of(ip: IpAddr) -> Network {
         match canonical(ip) {
-            IpAddr::V4(v4) => Network(IpAddr::V4(Ipv4Addr::from(u32::from(v4) & prefix_mask_v4(24)))),
-            IpAddr::V6(v6) => Network(IpAddr::V6(Ipv6Addr::from(u128::from(v6) & prefix_mask_v6(64)))),
+            IpAddr::V4(v4) => Network(IpAddr::V4(Ipv4Addr::from(
+                u32::from(v4) & prefix_mask_v4(24),
+            ))),
+            IpAddr::V6(v6) => Network(IpAddr::V6(Ipv6Addr::from(
+                u128::from(v6) & prefix_mask_v6(64),
+            ))),
         }
     }
 
@@ -38,18 +42,28 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
 }
 
 pub fn prefix_mask_v4(prefix: u8) -> u32 {
-    if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix)) }
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    }
 }
 
 pub fn prefix_mask_v6(prefix: u8) -> u128 {
-    if prefix == 0 { 0 } else { u128::MAX << (128 - u32::from(prefix)) }
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix))
+    }
 }
 
 /// Parses a client address as resolved from `CF-Connecting-IP` / `X-Forwarded-For` / the peer,
 /// tolerating a trailing port
 pub fn parse_client_ip(client_ip: &str) -> Option<IpAddr> {
     let trimmed = client_ip.trim();
-    trimmed.parse::<IpAddr>().ok()
+    trimmed
+        .parse::<IpAddr>()
+        .ok()
         .or_else(|| trimmed.parse::<SocketAddr>().ok().map(|socket| socket.ip()))
         .map(canonical)
 }
@@ -64,17 +78,38 @@ mod tests {
 
     #[test]
     fn ipv4_clients_are_keyed_by_slash_24() {
-        assert_eq!(network_of("203.0.113.77").as_deref(), Some("203.0.113.0/24"));
-        assert_eq!(network_of(" 203.0.113.200:4431 ").as_deref(), Some("203.0.113.0/24"));
-        assert_eq!(network_of("::ffff:203.0.113.5").as_deref(), Some("203.0.113.0/24"));
-        assert_eq!(network_of("203.0.114.77").as_deref(), Some("203.0.114.0/24"));
+        assert_eq!(
+            network_of("203.0.113.77").as_deref(),
+            Some("203.0.113.0/24")
+        );
+        assert_eq!(
+            network_of(" 203.0.113.200:4431 ").as_deref(),
+            Some("203.0.113.0/24")
+        );
+        assert_eq!(
+            network_of("::ffff:203.0.113.5").as_deref(),
+            Some("203.0.113.0/24")
+        );
+        assert_eq!(
+            network_of("203.0.114.77").as_deref(),
+            Some("203.0.114.0/24")
+        );
     }
 
     #[test]
     fn ipv6_clients_are_keyed_by_slash_64() {
-        assert_eq!(network_of("2001:db8:1:2:aaaa:bbbb:cccc:dddd").as_deref(), Some("2001:db8:1:2::/64"));
-        assert_eq!(network_of("[2001:db8:1:2::9]:443").as_deref(), Some("2001:db8:1:2::/64"));
-        assert_eq!(network_of("2001:db8:1:3::1").as_deref(), Some("2001:db8:1:3::/64"));
+        assert_eq!(
+            network_of("2001:db8:1:2:aaaa:bbbb:cccc:dddd").as_deref(),
+            Some("2001:db8:1:2::/64")
+        );
+        assert_eq!(
+            network_of("[2001:db8:1:2::9]:443").as_deref(),
+            Some("2001:db8:1:2::/64")
+        );
+        assert_eq!(
+            network_of("2001:db8:1:3::1").as_deref(),
+            Some("2001:db8:1:3::/64")
+        );
     }
 
     #[test]
