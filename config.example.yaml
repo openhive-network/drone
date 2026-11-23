@@ -28,6 +28,16 @@ drone:
   metrics_path: "/metrics"     # Path for Prometheus scraping
   metrics_namespace: "drone"   # Prefix for all metric names (e.g., drone_requests_total)
   debug_endpoints_enabled: false  # Enable /debug/jemalloc_stats and /debug/heap_profile (requires jemalloc feature)
+  # Per-client-network cost (default on).  Clients are grouped by /24 (IPv4) or /64 (IPv6),
+  # keyed like cost_limit below.  JSON access log entries get client_net and response_bytes;
+  # with metrics enabled, drone_client_net_{backend_seconds,response_bytes,requests}_total{client_net}
+  # carry the client_cost_top_networks networks with the most backend seconds recently (decaying
+  # with client_cost_window_seconds as time constant) and client_net="other" for the rest.  A
+  # network's series moves into "other" when it drops out of the top, so sum over client_net
+  # for grand totals.
+  client_cost_metrics: true
+  client_cost_top_networks: 20
+  client_cost_window_seconds: 300
 # The remainder of this file is based on the information in existing jussi config files,
 # just in a more concise yaml format.
 
