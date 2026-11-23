@@ -90,16 +90,25 @@ pub struct DroneConfig {
 
     /// whether to trust the `X-Forwarded-For` header for the real client IP. Enable this only
     /// when drone runs behind a reverse proxy that appends to it (e.g. Caddy/HAProxy). When
-    /// enabled and `CF-Connecting-IP` is absent, the client IP is the right-most address of
+    /// enabled and `CF-Connecting-IP` is not believed, the client IP is the right-most address of
     /// `X-Forwarded-For` that is not one of `trusted_proxies`, so entries the client wrote
     /// itself are ignored. Default: false.
     #[serde(default)]
     pub trust_forwarded_for: bool,
 
+    /// whether to take the client IP from the `CF-Connecting-IP` header (set by Cloudflare).
+    /// It is believed only from a peer listed in `trusted_proxies` (an empty list trusts none),
+    /// takes precedence over `X-Forwarded-For`, and is ignored when it is not an address.
+    /// Default: false.
+    #[serde(default)]
+    pub trust_cf_connecting_ip: bool,
+
     /// the reverse proxies (CIDR, e.g. `10.0.0.0/8`, or a single address) whose
-    /// `X-Forwarded-For` entries are believed when `trust_forwarded_for` is set.  When set, a
+    /// `X-Forwarded-For` entries are believed when `trust_forwarded_for` is set, and whose
+    /// `CF-Connecting-IP` is believed when `trust_cf_connecting_ip` is set.  When set, a
     /// connection from a peer outside the list has its `X-Forwarded-For` ignored.  Empty (the
-    /// default) trusts only the connecting peer: one proxy hop.
+    /// default) trusts only the connecting peer for `X-Forwarded-For` (one proxy hop) and no
+    /// peer for `CF-Connecting-IP`.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
@@ -342,6 +351,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
             access_log_file: String::new(),
             access_log_flush_every_line: false,
             trust_forwarded_for: false,
+            trust_cf_connecting_ip: false,
             trusted_proxies: Vec::new(),
             metrics_enabled: true,
             metrics_path: "/metrics".to_string(),
