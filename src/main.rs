@@ -40,9 +40,19 @@ pub mod metrics;
 
 pub mod account_history;
 use account_history::HistoryPage;
+
+pub mod cost_limit;
+use cost_limit::{Admission, CostLimiter};
 use metrics::DroneMetrics;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// JSON-RPC error code of a request refused by the cost limiter (implementation-defined server error)
+const COST_LIMIT_ERROR_CODE: i32 = -32029;
+
+/// Networks below this fraction of their budget are left out of the usage gauge, which would
+/// otherwise carry a series for every network that made a cache miss in the last window
+const COST_LIMIT_GAUGE_MIN_RATIO: f64 = 0.1;
 
 
 struct BlockchainState {
@@ -254,7 +264,9 @@ struct ErrorStructure {
     id: ID,
     error: Value,
     http_status: StatusCode,
-    tracking_info: Option<ResponseTrackingInfo>
+    tracking_info: Option<ResponseTrackingInfo>,
+    /// seconds for the `Retry-After` header, when the request was refused by the cost limiter
+    retry_after: Option<u64>
 }
 
 #[derive(Clone)]
@@ -739,7 +751,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 "error": "Unable to parse request method."
             }),
             http_status: StatusCode::NOT_FOUND,
-            tracking_info: None
+            tracking_info: None,
+            retry_after: None
         }
     })?;
 
@@ -783,9 +796,45 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
+    let admission = data.cost_limiter.as_ref().map_or(Admission::Exempt, |limiter| limiter.admit(client_ip, Instant::now()));
+
     let mut upstream_was_called = false;
-    let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
-                                                 async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await;
+    let cache_entry = match admission {
+        Admission::Throttled { network, retry_after } => {
+            // an over-budget network is still served from the cache, since hits cost the backend nothing
+            match data.cache.get(&method_and_params_str).await {
+                Some(cache_entry) => cache_entry,
+                None => {
+                    data.metrics.dec_active_requests();
+                    let network = network.to_string();
+                    let retry_after_secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+                    debug!(request_id=request_id.as_str(); "cost_limit: refusing {} from {client_ip} ({network}), retry after {retry_after_secs}s", request.method);
+                    data.metrics.record_cost_limit_throttled(&network);
+                    data.metrics.record_request_error(
+                        &mapped_method.namespace,
+                        mapped_method.api.as_deref().unwrap_or(""),
+                        &mapped_method.method,
+                        COST_LIMIT_ERROR_CODE,
+                        false,
+                        request_start.elapsed().as_secs_f64()
+                    );
+                    return Err(throttled_error(request, &network, retry_after_secs));
+                }
+            }
+        }
+        Admission::Exempt | Admission::Allowed(_) => {
+            data.cache.get_with_by_ref(&method_and_params_str,
+                                       async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await
+        }
+    };
+
+    if let (Admission::Allowed(network), Some(limiter), true) = (admission, data.cost_limiter.as_ref(), upstream_was_called) {
+        let backend_seconds = match &cache_entry.result {
+            Ok(response) => response.backend_duration_secs,
+            Err(error) => error.backend_duration_secs,
+        };
+        limiter.charge(network, mapped_method.get_method_name_parts(), backend_seconds.unwrap_or(0.0), cache_entry.size as u64, Instant::now());
+    }
 
     let duration_seconds = request_start.elapsed().as_secs_f64();
     data.metrics.dec_active_requests();
@@ -877,7 +926,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 id : request.id,
                 error: error_data.error.clone(),
                 http_status: error_http_status,
-                tracking_info: None
+                tracking_info: None,
+                retry_after: None
             };
             let cached = !upstream_was_called;
 
@@ -937,20 +987,34 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     }
 }
 
-async fn api_call(
-    req: HttpRequest,
-    call: web::Json<APICall>,
-    data: web::Data<AppData>,
-    request_id: RequestId
-) -> impl Responder {
+/// The answer to a cache-missing request from a network that is over its cost budget
+fn throttled_error(request: APIRequest, network: &str, retry_after_secs: u64) -> ErrorStructure {
+    ErrorStructure {
+        jsonrpc: request.jsonrpc,
+        id: request.id,
+        error: json!({
+            "code": COST_LIMIT_ERROR_CODE,
+            "message": "Too many expensive requests from your network, retry later.",
+            "error": format!("Backend cost budget of {network} exceeded, retry after {retry_after_secs} seconds."),
+            "retry_after": retry_after_secs
+        }),
+        http_status: StatusCode::TOO_MANY_REQUESTS,
+        tracking_info: None,
+        retry_after: Some(retry_after_secs)
+    }
+}
+
+/// The client's address: `CF-Connecting-IP`, else (when trusted) the left-most `X-Forwarded-For`
+/// address, else the peer.  `None` when the `CF-Connecting-IP` header is not valid text.
+fn resolve_client_ip(req: &HttpRequest, trust_forwarded_for: bool) -> Option<String> {
     let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
 
-    let client_ip = match get_cloudflare_ip {
-        Some(ip) => ip.to_str().map(|ip| ip.to_string()),
+    match get_cloudflare_ip {
+        Some(ip) => ip.to_str().map(|ip| ip.to_string()).ok(),
         None => {
             // Behind a reverse proxy (e.g. Caddy/HAProxy) the peer address is the proxy, not the
             // client. When configured to trust it, use the left-most address of X-Forwarded-For.
-            let forwarded_ip = if data.config.drone.trust_forwarded_for {
+            let forwarded_ip = if trust_forwarded_for {
                 req.headers()
                     .get("X-Forwarded-For")
                     .and_then(|value| value.to_str().ok())
@@ -961,14 +1025,22 @@ async fn api_call(
                 None
             };
             match forwarded_ip {
-                Some(ip) => Ok(ip),
-                None => Ok(req.peer_addr().unwrap().ip().to_string()),
+                Some(ip) => Some(ip),
+                None => Some(req.peer_addr().unwrap().ip().to_string()),
             }
         }
-    };
-    let user_ip = match client_ip {
-        Ok(ip) => ip,
-        Err(_) => {
+    }
+}
+
+async fn api_call(
+    req: HttpRequest,
+    call: web::Json<APICall>,
+    data: web::Data<AppData>,
+    request_id: RequestId
+) -> impl Responder {
+    let user_ip = match resolve_client_ip(&req, data.config.drone.trust_forwarded_for) {
+        Some(ip) => ip,
+        None => {
             return HttpResponse::InternalServerError().json(json!({
                 "jsonrpc": "2.0",
                 "id": 0,
@@ -1003,6 +1075,9 @@ async fn api_call(
                     debug!(request_id=request_id.as_str(); "Constructing HttpResponse for an Err, status should be {}", err.http_status);
                     let mut reply_builder = HttpResponse::build(err.http_status);
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if let Some(retry_after) = err.retry_after {
+                        reply_builder.insert_header(("Retry-After", retry_after.to_string()));
+                    }
                     if let Some(tracking_info) = err.tracking_info {
                         tracking_info.into_headers(&mut reply_builder);
                     }
@@ -1032,6 +1107,8 @@ async fn api_call(
             // the "cached" property isn't particularly useful for batch requests, so don't
             // overthink it
             let mut cached = true;
+            // a batch answers 200 with per-request errors; Retry-After covers its throttled requests
+            let mut retry_after: Option<u64> = None;
             for request in requests {
                 let result = handle_request(request, &data, &user_ip, &request_id).await;
                 match result {
@@ -1044,6 +1121,7 @@ async fn api_call(
                             response.jsonrpc, response.result_json, id_json));
                     },
                     Err(err) => {
+                        retry_after = retry_after.max(err.retry_after);
                         let id_json = serde_json::to_string(&err.id).unwrap();
                         let error_json = serde_json::to_string(&err.error).unwrap();
                         responses.push(format!(r#"{{"jsonrpc":"{}","id":{},"error":{}}}"#,
@@ -1052,9 +1130,14 @@ async fn api_call(
                 }
             }
             let body = format!("[{}]", responses.join(","));
-            HttpResponse::Ok()
+            let mut reply_builder = HttpResponse::Ok();
+            reply_builder
                 .insert_header(("Drone-Version", DRONE_VERSION))
-                .insert_header(("Cache-Status", cached.to_string()))
+                .insert_header(("Cache-Status", cached.to_string()));
+            if let Some(retry_after) = retry_after {
+                reply_builder.insert_header(("Retry-After", retry_after.to_string()));
+            }
+            reply_builder
                 .content_type("application/json")
                 .body(body)
         }
@@ -1069,14 +1152,10 @@ struct AppData {
     metrics: Arc<DroneMetrics>,
     access_log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
     access_log_flush_every_line: bool,
+    cost_limiter: Option<Arc<CostLimiter>>,
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init();
-    // Load config.
-    let app_config = config::parse_file("config.yaml");
-
+fn build_cache(max_capacity: u64) -> Cache<String, CacheEntry> {
     // helpers for the cach
     let expiry = MyExpiry;
     let eviction_listener = |key, _value, cause| {
@@ -1086,16 +1165,28 @@ async fn main() -> std::io::Result<()> {
         value.size
     };
 
-    // Initialize metrics
-    let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
-
-    // Create the cache.
-    let cache = Cache::builder()
-        .max_capacity(app_config.drone.cache_max_capacity)
+    Cache::builder()
+        .max_capacity(max_capacity)
         .expire_after(expiry)
         .eviction_listener(eviction_listener)
         .weigher(weigher)
-        .build();
+        .build()
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::init();
+    // Load config.
+    let app_config = config::parse_file("config.yaml");
+
+    let cost_limiter = CostLimiter::from_config(&app_config.cost_limit)
+        .unwrap_or_else(|e| panic!("Invalid cost_limit config: {}", e))
+        .map(Arc::new);
+
+    // Initialize metrics
+    let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
+
+    let cache = build_cache(app_config.drone.cache_max_capacity);
 
     // Clone cache and metrics for background task
     let cache_for_metrics = cache.clone();
@@ -1111,6 +1202,25 @@ async fn main() -> std::io::Result<()> {
             metrics_for_task.update_cache_metrics(size_bytes, entry_count);
         }
     });
+
+    // Spawn background task to refresh the cost limiter's usage gauge (and forget drained
+    // networks) every 15 seconds
+    if let Some(ref limiter) = cost_limiter {
+        info!("cost_limit enabled: {:?}", app_config.cost_limit);
+        let limiter_for_task = Arc::clone(limiter);
+        let metrics_for_task = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let ratios: Vec<(String, &str, f64)> = limiter_for_task.usage_ratios(Instant::now()).into_iter()
+                    .filter(|usage| usage.ratio >= COST_LIMIT_GAUGE_MIN_RATIO)
+                    .map(|usage| (usage.network.to_string(), usage.resource, usage.ratio))
+                    .collect();
+                metrics_for_task.update_cost_limit_usage(ratios.iter().map(|(network, resource, ratio)| (network.as_str(), *resource, *ratio)));
+            }
+        });
+    }
 
     // Initialize access log file if configured
     // Use 32KB buffer (same as nginx default) for high-throughput scenarios
@@ -1159,6 +1269,7 @@ async fn main() -> std::io::Result<()> {
         metrics,
         access_log_writer,
         access_log_flush_every_line,
+        cost_limiter,
     });
 
     let metrics_enabled = app_config.drone.metrics_enabled;
@@ -1208,9 +1319,14 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_page_ttl, is_block_result_empty, CacheTtl, HistoryPage, UpstreamJsonRpcResponse};
-    use serde_json::json;
+    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, resolve_client_ip, AppData, BlockchainState, CacheTtl, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
+    use actix_request_identifier::RequestIdentifier;
+    use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::RwLock;
 
     /// The moka expiry the TTL maps to: `None` never expires, `Some(ZERO)` is not cached
     fn expiry(ttl: CacheTtl) -> Option<Duration> {
@@ -1282,5 +1398,151 @@ mod tests {
                 .unwrap();
         assert!(e.result.is_none());
         assert!(e.error.is_none());
+    }
+
+    #[test]
+    fn client_ip_comes_from_x_forwarded_for_only_when_trusted() {
+        let peer = "10.0.0.1:5000".parse().unwrap();
+        let forwarded = actix_test::TestRequest::default().peer_addr(peer)
+            .insert_header(("X-Forwarded-For", "203.0.113.7, 10.0.0.1")).to_http_request();
+        assert_eq!(resolve_client_ip(&forwarded, true).as_deref(), Some("203.0.113.7"));
+        assert_eq!(resolve_client_ip(&forwarded, false).as_deref(), Some("10.0.0.1"));
+
+        let cloudflare = actix_test::TestRequest::default().peer_addr(peer)
+            .insert_header(("CF-Connecting-IP", "198.51.100.4"))
+            .insert_header(("X-Forwarded-For", "203.0.113.7")).to_http_request();
+        assert_eq!(resolve_client_ip(&cloudflare, true).as_deref(), Some("198.51.100.4"));
+    }
+
+    const BACKEND_RESULT_BYTES: usize = 1000;
+
+    /// Starts a backend answering every call with a string result of `BACKEND_RESULT_BYTES`
+    /// characters, and returns its URL and its call counter
+    fn start_backend() -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = calls.clone();
+        let server = HttpServer::new(move || {
+            let calls = calls_for_server.clone();
+            App::new().route("/", web::post().to(move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    HttpResponse::Ok().content_type("application/json")
+                        .body(format!(r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#, "x".repeat(BACKEND_RESULT_BYTES)))
+                }
+            }))
+        })
+        .workers(1)
+        .bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", server.addrs()[0]);
+        actix_web::rt::spawn(server.run());
+        (url, calls)
+    }
+
+    fn app_data(backend_url: &str, cost_limit_yaml: &str) -> web::Data<AppData> {
+        static CONFIG_FILES: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("drone-cost-limit-test-{}-{}.yaml", std::process::id(), CONFIG_FILES.fetch_add(1, Ordering::SeqCst)));
+        std::fs::write(&path, format!(r#"
+drone: {{port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true}}
+backends: {{hived: "{backend_url}"}}
+translate_to_appbase: []
+urls: {{appbase: hived}}
+ttls: {{appbase: 60}}
+timeouts: {{appbase: 3}}
+equivalent_methods: {{}}
+cost_limit: {cost_limit_yaml}
+"#)).unwrap();
+        let app_config = config::parse_file(path.to_str().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        web::Data::new(AppData {
+            cache: build_cache(app_config.drone.cache_max_capacity),
+            webclient: reqwest::Client::new(),
+            cost_limiter: CostLimiter::from_config(&app_config.cost_limit).unwrap().map(Arc::new),
+            config: app_config,
+            blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
+            metrics: Arc::new(DroneMetrics::new("drone_test")),
+            access_log_writer: None,
+            access_log_flush_every_line: false,
+        })
+    }
+
+    fn call(client_ip: &str, body: Value) -> actix_test::TestRequest {
+        actix_test::TestRequest::post().uri("/")
+            .peer_addr("10.0.0.1:5000".parse().unwrap())
+            .insert_header(("X-Forwarded-For", client_ip))
+            .set_json(body)
+    }
+
+    fn get_accounts(account: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "condenser_api.get_accounts", "params": [[account]]})
+    }
+
+    #[actix_web::test]
+    async fn network_over_its_byte_budget_gets_429_for_misses_but_keeps_its_cache_hits() {
+        let (backend_url, backend_calls) = start_backend();
+        // two misses (about 2 x 1000 bytes) exceed the budget
+        let data = app_data(&backend_url, "{enabled: true, window_seconds: 60, response_bytes: 1500, allowlist: [192.0.2.0/24]}");
+        let app = actix_test::init_service(App::new()
+            .wrap(RequestIdentifier::with_uuid())
+            .app_data(data.clone())
+            .route("/", web::post().to(api_call))).await;
+
+        for (client_ip, account) in [("203.0.113.7", "a"), ("203.0.113.8", "b")] {
+            let response = actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request()).await;
+            assert_eq!(response.status(), 200);
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+
+        // another address of the same /24: refused without calling the backend
+        let response = actix_test::call_service(&app, call("203.0.113.9", get_accounts("c")).to_request()).await;
+        assert_eq!(response.status(), 429);
+        let retry_after: u64 = response.headers().get("Retry-After").unwrap().to_str().unwrap().parse().unwrap();
+        assert!((1..=60).contains(&retry_after), "Retry-After {retry_after}");
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], -32029);
+        assert_eq!(body["id"], 1);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+
+        // its cache hits are still served
+        let response = actix_test::call_service(&app, call("203.0.113.9", get_accounts("a")).to_request()).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers().get("X-Jussi-Cache-Hit").unwrap(), "true");
+
+        // in a batch, the misses get the error and the hits their result
+        let batch = json!([get_accounts("a"), get_accounts("f")]);
+        let response = actix_test::call_service(&app, call("203.0.113.9", batch).to_request()).await;
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().contains_key("Retry-After"));
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body[0]["result"].as_str().map(str::len), Some(BACKEND_RESULT_BYTES));
+        assert_eq!(body[1]["error"]["code"], -32029);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+
+        // other networks and allowlisted ones are unaffected
+        for (client_ip, account) in [("203.0.114.9", "d"), ("192.0.2.5", "e"), ("192.0.2.5", "g"), ("192.0.2.5", "h")] {
+            let response = actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request()).await;
+            assert_eq!(response.status(), 200, "{client_ip}");
+            assert!(!response.headers().contains_key("Retry-After"));
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 6);
+
+        let metrics = data.metrics.encode();
+        assert!(metrics.contains(r#"drone_test_cost_limit_throttled_total{network="203.0.113.0/24"} 2"#), "{metrics}");
+    }
+
+    #[actix_web::test]
+    async fn a_disabled_cost_limit_throttles_nothing() {
+        let (backend_url, backend_calls) = start_backend();
+        let data = app_data(&backend_url, "{response_bytes: 1}");
+        assert!(data.cost_limiter.is_none());
+        let app = actix_test::init_service(App::new()
+            .wrap(RequestIdentifier::with_uuid())
+            .app_data(data)
+            .route("/", web::post().to(api_call))).await;
+        for account in ["a", "b", "c"] {
+            let response = actix_test::call_service(&app, call("203.0.113.7", get_accounts(account)).to_request()).await;
+            assert_eq!(response.status(), 200);
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
     }
 }

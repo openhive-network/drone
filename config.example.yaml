@@ -188,6 +188,31 @@ timeouts:
   appbase.condenser_api.broadcast_transaction_synchronous: 0
   # appbase.condenser_api.get_ops_in_block.params=[2889020,false]: 20
 
+# per-client-network budget for the backend cost of cache misses (off by default).
+# Clients are grouped by their /24 (IPv4) or /64 (IPv6) network, using the address from
+# CF-Connecting-IP, or X-Forwarded-For when drone.trust_forwarded_for is set.  Every cache
+# miss charges its backend time and response size (times its method weight) to the network.
+# The spent cost drains continuously at budget/window_seconds; while a network is over budget
+# in either resource, its cache misses are answered with HTTP 429 (JSON-RPC error -32029) and
+# a Retry-After header, without calling the backend.  Its cache hits are still served.
+# Metrics: drone_cost_limit_throttled_total{network} and
+# drone_cost_limit_usage_ratio{network,resource} (networks at >= 10% of their budget).
+cost_limit:
+  enabled: false
+  window_seconds: 60
+  backend_seconds: 60          # backend seconds per network per window (omit = unlimited)
+  response_bytes: 500000000    # response bytes per network per window (omit = unlimited)
+  # networks never throttled: CIDRs or single addresses (front-ends, internal)
+  allowlist:
+    - 127.0.0.0/8
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # cost multipliers, matched like ttls (most specific wins; default 1)
+  method_weights:
+    appbase.condenser_api.get_account_history: 1
+    appbase.account_history_api.get_account_history: 1
+
 # method rewriting rules.  There are a few API calls where you can get the
 # same result by calling several different methods.  By default, Drone will
 # only share cache entries between calls where the method name and parameters
