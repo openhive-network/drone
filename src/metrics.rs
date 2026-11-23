@@ -37,6 +37,11 @@ pub struct DroneMetrics {
     // Per-client-network cost limiter
     pub cost_limit_throttled_total: CounterVec,
     pub cost_limit_usage_ratio: GaugeVec,
+
+    // Per-client-network cost, for the top networks and `other`
+    pub client_net_backend_seconds_total: CounterVec,
+    pub client_net_response_bytes_total: CounterVec,
+    pub client_net_requests_total: CounterVec,
 }
 
 impl DroneMetrics {
@@ -123,6 +128,24 @@ impl DroneMetrics {
             &["network", "resource"]
         ).expect("Failed to create cost_limit_usage_ratio gauge");
 
+        let client_net_backend_seconds_total = CounterVec::new(
+            Opts::new("client_net_backend_seconds_total", "Backend seconds spent on cache misses of a client network (top networks by recent backend seconds, the rest as \"other\")")
+                .namespace(namespace),
+            &["client_net"]
+        ).expect("Failed to create client_net_backend_seconds_total counter");
+
+        let client_net_response_bytes_total = CounterVec::new(
+            Opts::new("client_net_response_bytes_total", "Response bytes sent to a client network (top networks by recent backend seconds, the rest as \"other\")")
+                .namespace(namespace),
+            &["client_net"]
+        ).expect("Failed to create client_net_response_bytes_total counter");
+
+        let client_net_requests_total = CounterVec::new(
+            Opts::new("client_net_requests_total", "JSON-RPC requests of a client network (top networks by recent backend seconds, the rest as \"other\")")
+                .namespace(namespace),
+            &["client_net"]
+        ).expect("Failed to create client_net_requests_total counter");
+
         // Register all metrics
         registry.register(Box::new(requests_total.clone())).expect("Failed to register requests_total");
         registry.register(Box::new(requests_cached_total.clone())).expect("Failed to register requests_cached_total");
@@ -136,6 +159,9 @@ impl DroneMetrics {
         registry.register(Box::new(blockchain_lib.clone())).expect("Failed to register blockchain_lib");
         registry.register(Box::new(cost_limit_throttled_total.clone())).expect("Failed to register cost_limit_throttled_total");
         registry.register(Box::new(cost_limit_usage_ratio.clone())).expect("Failed to register cost_limit_usage_ratio");
+        registry.register(Box::new(client_net_backend_seconds_total.clone())).expect("Failed to register client_net_backend_seconds_total");
+        registry.register(Box::new(client_net_response_bytes_total.clone())).expect("Failed to register client_net_response_bytes_total");
+        registry.register(Box::new(client_net_requests_total.clone())).expect("Failed to register client_net_requests_total");
 
         DroneMetrics {
             registry,
@@ -151,6 +177,9 @@ impl DroneMetrics {
             blockchain_lib,
             cost_limit_throttled_total,
             cost_limit_usage_ratio,
+            client_net_backend_seconds_total,
+            client_net_response_bytes_total,
+            client_net_requests_total,
         }
     }
 
@@ -255,6 +284,18 @@ impl DroneMetrics {
             self.cost_limit_usage_ratio
                 .with_label_values(&[network, resource])
                 .set(ratio);
+        }
+    }
+
+    /// Replace the per-network cost with `costs` of (client_net, backend seconds, response bytes, requests)
+    pub fn update_client_net_costs<'a>(&self, costs: impl IntoIterator<Item = (&'a str, f64, u64, u64)>) {
+        self.client_net_backend_seconds_total.reset();
+        self.client_net_response_bytes_total.reset();
+        self.client_net_requests_total.reset();
+        for (client_net, backend_seconds, response_bytes, requests) in costs {
+            self.client_net_backend_seconds_total.with_label_values(&[client_net]).inc_by(backend_seconds);
+            self.client_net_response_bytes_total.with_label_values(&[client_net]).inc_by(response_bytes as f64);
+            self.client_net_requests_total.with_label_values(&[client_net]).inc_by(requests as f64);
         }
     }
 

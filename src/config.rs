@@ -27,6 +27,8 @@ fn default_metrics_path() -> String { "/metrics".to_string() }
 fn default_metrics_namespace() -> String { "drone".to_string() }
 fn default_access_log_format() -> String { "simple".to_string() }
 fn default_empty_string() -> String { String::new() }
+fn default_client_cost_top_networks() -> usize { 20 }
+fn default_client_cost_window_seconds() -> u64 { 300 }
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -89,6 +91,22 @@ pub struct DroneConfig {
     /// whether to enable debug endpoints (jemalloc stats, heap profiling)
     #[serde(default)]
     pub debug_endpoints_enabled: bool,
+
+    /// whether to account each request's cost to its client network (`client_net`): adds
+    /// `client_net` and `response_bytes` to the JSON access log, and per-network cost counters
+    /// to the metrics (see `client_cost::ClientCostTracker`).  Default: true
+    #[serde(default = "default_to_true")]
+    pub client_cost_metrics: bool,
+
+    /// how many client networks, by recent backend seconds, the metrics carry individually;
+    /// the rest are summed as `client_net="other"`.  Default: 20
+    #[serde(default = "default_client_cost_top_networks")]
+    pub client_cost_top_networks: usize,
+
+    /// the time constant, in seconds, of the decaying backend seconds the top networks are
+    /// ranked by.  Default: 300
+    #[serde(default = "default_client_cost_window_seconds")]
+    pub client_cost_window_seconds: u64,
 }
 
 
@@ -266,7 +284,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false, client_cost_metrics: true, client_cost_top_networks: default_client_cost_top_networks(), client_cost_window_seconds: default_client_cost_window_seconds()},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),

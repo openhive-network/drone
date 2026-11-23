@@ -41,6 +41,12 @@ pub mod metrics;
 pub mod account_history;
 use account_history::HistoryPage;
 
+pub mod client_net;
+use client_net::Network;
+
+pub mod client_cost;
+use client_cost::ClientCostTracker;
+
 pub mod cost_limit;
 use cost_limit::{Admission, CostLimiter};
 use metrics::DroneMetrics;
@@ -105,10 +111,26 @@ async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
 }
 
 async fn metrics_handler(appdata: web::Data<AppData>) -> impl Responder {
+    if let Some(ref tracker) = appdata.client_costs {
+        publish_client_costs(tracker, &appdata.metrics, Instant::now());
+    }
     let metrics_text = appdata.metrics.encode();
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4; charset=utf-8")
         .body(metrics_text)
+}
+
+/// Exports the top client networks' cost, and the rest as `other`, to the metrics
+fn publish_client_costs(tracker: &ClientCostTracker, metrics: &DroneMetrics, now: Instant) {
+    let top = tracker.top(now);
+    let mut costs: Vec<(String, client_cost::Totals)> = top.networks.into_iter()
+        .map(|(network, totals)| (network.to_string(), totals))
+        .collect();
+    if top.other.requests > 0 {
+        costs.push(("other".to_string(), top.other));
+    }
+    metrics.update_client_net_costs(costs.iter()
+        .map(|(client_net, totals)| (client_net.as_str(), totals.backend_seconds, totals.response_bytes, totals.requests)));
 }
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
@@ -705,6 +727,20 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     }
 }
 
+/// A request's cost to its client network, accounted when `client_cost_metrics` is on
+struct RequestCost {
+    /// `None` when the client address does not parse
+    client_net: Option<Network>,
+    response_bytes: usize,
+}
+
+/// Charges a request's cost to the client cost tracker, if there is one
+fn record_client_cost(data: &web::Data<AppData>, cost: Option<&RequestCost>, backend_time: Option<f64>) {
+    if let (Some(cost), Some(tracker)) = (cost, data.client_costs.as_ref()) {
+        tracker.record(cost.client_net, backend_time.unwrap_or(0.0), cost.response_bytes as u64, Instant::now());
+    }
+}
+
 /// Build a JSON access log entry for file logging
 fn build_access_log_json(
     client_ip: &str,
@@ -715,11 +751,12 @@ fn build_access_log_json(
     request_body_json: &str,
     request_id: &RequestId,
     status: u16,
+    cost: Option<&RequestCost>,
 ) -> Value {
     let now = chrono::Local::now();
     let time_local = now.format("%d/%b/%Y:%H:%M:%S %z").to_string();
 
-    json!({
+    let mut entry = json!({
         "time_local": time_local,
         "status": status,
         "request": "POST / HTTP/1.1",
@@ -732,7 +769,12 @@ fn build_access_log_json(
         "cache_hit": cached,
         "request_body": request_body_json,
         "request_id": request_id.as_str()
-    })
+    });
+    if let Some(cost) = cost {
+        entry["client_net"] = json!(cost.client_net.map(|network| network.to_string()));
+        entry["response_bytes"] = json!(cost.response_bytes);
+    }
+    entry
 }
 
 async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId) -> Result<APICallResponse, ErrorStructure> {
@@ -796,6 +838,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
+    // `Some` when client cost is accounted
+    let client_net = data.config.drone.client_cost_metrics.then(|| Network::of_client(client_ip));
+
     let admission = data.cost_limiter.as_ref().map_or(Admission::Exempt, |limiter| limiter.admit(client_ip, Instant::now()));
 
     let mut upstream_was_called = false;
@@ -818,7 +863,10 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                         false,
                         request_start.elapsed().as_secs_f64()
                     );
-                    return Err(throttled_error(request, &network, retry_after_secs));
+                    let error = throttled_error(request, &network, retry_after_secs);
+                    let cost = client_net.map(|client_net| RequestCost { client_net, response_bytes: error.error.to_string().len() });
+                    record_client_cost(data, cost.as_ref(), None);
+                    return Err(error);
                 }
             }
         }
@@ -864,6 +912,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             );
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
+            let cost = client_net.map(|client_net| RequestCost { client_net, response_bytes: api_call_response.result_json.len() });
+            record_client_cost(data, cost.as_ref(), backend_time);
 
             // Write to access log file if configured (always JSON format)
             if let Some(ref writer) = data.access_log_writer {
@@ -876,6 +926,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                     &request_body_json,
                     request_id,
                     200,
+                    cost.as_ref(),
                 );
                 if let Ok(mut w) = writer.lock() {
                     let _ = writeln!(w, "{}", log_entry);
@@ -896,6 +947,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                     &request_body_json,
                     request_id,
                     200,
+                    cost.as_ref(),
                 );
                 info!(target: "access_log", "{}", log_entry);
             }
@@ -946,6 +998,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
             let http_status = error_http_status.as_u16();
+            let cost = client_net.map(|client_net| RequestCost { client_net, response_bytes: error_data.error.to_string().len() });
+            record_client_cost(data, cost.as_ref(), backend_time);
 
             // Write to access log file if configured (always JSON format)
             if let Some(ref writer) = data.access_log_writer {
@@ -958,6 +1012,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                     &request_body_json,
                     request_id,
                     http_status,
+                    cost.as_ref(),
                 );
                 if let Ok(mut w) = writer.lock() {
                     let _ = writeln!(w, "{}", log_entry);
@@ -978,6 +1033,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                     &request_body_json,
                     request_id,
                     http_status,
+                    cost.as_ref(),
                 );
                 info!(target: "access_log", "{}", log_entry);
             }
@@ -1153,6 +1209,7 @@ struct AppData {
     access_log_writer: Option<Arc<Mutex<BufWriter<File>>>>,
     access_log_flush_every_line: bool,
     cost_limiter: Option<Arc<CostLimiter>>,
+    client_costs: Option<ClientCostTracker>,
 }
 
 fn build_cache(max_capacity: u64) -> Cache<String, CacheEntry> {
@@ -1182,6 +1239,9 @@ async fn main() -> std::io::Result<()> {
     let cost_limiter = CostLimiter::from_config(&app_config.cost_limit)
         .unwrap_or_else(|e| panic!("Invalid cost_limit config: {}", e))
         .map(Arc::new);
+
+    let client_costs = ClientCostTracker::from_config(&app_config.drone)
+        .unwrap_or_else(|e| panic!("Invalid client cost config: {}", e));
 
     // Initialize metrics
     let metrics = Arc::new(DroneMetrics::new(&app_config.drone.metrics_namespace));
@@ -1270,6 +1330,7 @@ async fn main() -> std::io::Result<()> {
         access_log_writer,
         access_log_flush_every_line,
         cost_limiter,
+        client_costs,
     });
 
     let metrics_enabled = app_config.drone.metrics_enabled;
@@ -1319,12 +1380,15 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, resolve_client_ip, AppData, BlockchainState, CacheTtl, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
+    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, metrics_handler, resolve_client_ip, AppData, BlockchainState, CacheTtl, ClientCostTracker, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
     use actix_request_identifier::RequestIdentifier;
     use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
     use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::BufWriter;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::RwLock;
 
@@ -1419,6 +1483,11 @@ mod tests {
     /// Starts a backend answering every call with a string result of `BACKEND_RESULT_BYTES`
     /// characters, and returns its URL and its call counter
     fn start_backend() -> (String, Arc<AtomicUsize>) {
+        start_slow_backend(Duration::ZERO)
+    }
+
+    /// `start_backend`, answering each call after `delay`
+    fn start_slow_backend(delay: Duration) -> (String, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_server = calls.clone();
         let server = HttpServer::new(move || {
@@ -1427,6 +1496,7 @@ mod tests {
                 let calls = calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    actix_web::rt::time::sleep(delay).await;
                     HttpResponse::Ok().content_type("application/json")
                         .body(format!(r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#, "x".repeat(BACKEND_RESULT_BYTES)))
                 }
@@ -1439,11 +1509,17 @@ mod tests {
         (url, calls)
     }
 
-    fn app_data(backend_url: &str, cost_limit_yaml: &str) -> web::Data<AppData> {
+    fn app_data(backend_url: &str, cost_limit_yaml: &str) -> AppData {
+        app_data_with(backend_url, cost_limit_yaml, "")
+    }
+
+    /// `app_data` with `drone_yaml` (`key: value, ...`) added to the `drone` section
+    fn app_data_with(backend_url: &str, cost_limit_yaml: &str, drone_yaml: &str) -> AppData {
+        let drone_yaml = if drone_yaml.is_empty() { String::new() } else { format!(", {drone_yaml}") };
         static CONFIG_FILES: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!("drone-cost-limit-test-{}-{}.yaml", std::process::id(), CONFIG_FILES.fetch_add(1, Ordering::SeqCst)));
         std::fs::write(&path, format!(r#"
-drone: {{port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true}}
+drone: {{port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true{drone_yaml}}}
 backends: {{hived: "{backend_url}"}}
 translate_to_appbase: []
 urls: {{appbase: hived}}
@@ -1454,16 +1530,17 @@ cost_limit: {cost_limit_yaml}
 "#)).unwrap();
         let app_config = config::parse_file(path.to_str().unwrap());
         std::fs::remove_file(&path).unwrap();
-        web::Data::new(AppData {
+        AppData {
             cache: build_cache(app_config.drone.cache_max_capacity),
             webclient: reqwest::Client::new(),
             cost_limiter: CostLimiter::from_config(&app_config.cost_limit).unwrap().map(Arc::new),
+            client_costs: ClientCostTracker::from_config(&app_config.drone).unwrap(),
             config: app_config,
             blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
             metrics: Arc::new(DroneMetrics::new("drone_test")),
             access_log_writer: None,
             access_log_flush_every_line: false,
-        })
+        }
     }
 
     fn call(client_ip: &str, body: Value) -> actix_test::TestRequest {
@@ -1481,7 +1558,7 @@ cost_limit: {cost_limit_yaml}
     async fn network_over_its_byte_budget_gets_429_for_misses_but_keeps_its_cache_hits() {
         let (backend_url, backend_calls) = start_backend();
         // two misses (about 2 x 1000 bytes) exceed the budget
-        let data = app_data(&backend_url, "{enabled: true, window_seconds: 60, response_bytes: 1500, allowlist: [192.0.2.0/24]}");
+        let data = web::Data::new(app_data(&backend_url, "{enabled: true, window_seconds: 60, response_bytes: 1500, allowlist: [192.0.2.0/24]}"));
         let app = actix_test::init_service(App::new()
             .wrap(RequestIdentifier::with_uuid())
             .app_data(data.clone())
@@ -1533,7 +1610,7 @@ cost_limit: {cost_limit_yaml}
     #[actix_web::test]
     async fn a_disabled_cost_limit_throttles_nothing() {
         let (backend_url, backend_calls) = start_backend();
-        let data = app_data(&backend_url, "{response_bytes: 1}");
+        let data = web::Data::new(app_data(&backend_url, "{response_bytes: 1}"));
         assert!(data.cost_limiter.is_none());
         let app = actix_test::init_service(App::new()
             .wrap(RequestIdentifier::with_uuid())
@@ -1544,5 +1621,107 @@ cost_limit: {cost_limit_yaml}
             assert_eq!(response.status(), 200);
         }
         assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// `data` logging to a fresh access log file, whose path is returned
+    fn with_access_log(mut data: AppData) -> (web::Data<AppData>, std::path::PathBuf) {
+        static LOG_FILES: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("drone-access-log-test-{}-{}.log", std::process::id(), LOG_FILES.fetch_add(1, Ordering::SeqCst)));
+        data.access_log_writer = Some(Arc::new(Mutex::new(BufWriter::new(File::create(&path).unwrap()))));
+        data.access_log_flush_every_line = true;
+        (web::Data::new(data), path)
+    }
+
+    fn read_access_log(path: &std::path::Path) -> Vec<Value> {
+        let text = std::fs::read_to_string(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        text.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    /// The `client_net` label values of a metric and their values
+    fn client_net_series(metrics: &str, name: &str) -> HashMap<String, f64> {
+        let prefix = format!("drone_test_{name}{{client_net=\"");
+        metrics.lines().filter_map(|line| line.strip_prefix(prefix.as_str()))
+            .map(|rest| {
+                let (label, value) = rest.split_once("\"} ").unwrap();
+                (label.to_string(), value.parse().unwrap())
+            })
+            .collect()
+    }
+
+    #[actix_web::test]
+    async fn metrics_carry_the_top_networks_by_backend_seconds_and_the_rest_as_other() {
+        let (backend_url, _) = start_slow_backend(Duration::from_millis(50));
+        let (data, log_path) = with_access_log(app_data_with(&backend_url, "{}", "metrics_enabled: true, client_cost_top_networks: 2"));
+        let app = actix_test::init_service(App::new()
+            .wrap(RequestIdentifier::with_uuid())
+            .app_data(data.clone())
+            .route("/", web::post().to(api_call))
+            .route("/metrics", web::get().to(metrics_handler))).await;
+
+        // three misses from 203.0.113.0/24, two from 2001:db8:1:2::/64, one from 198.51.100.0/24,
+        // and a cache hit from 192.0.2.0/24
+        let load = [("203.0.113.1", "a"), ("203.0.113.2", "b"), ("203.0.113.3", "c"),
+                    ("2001:db8:1:2::1", "d"), ("2001:db8:1:2::2", "e"),
+                    ("198.51.100.1", "f"), ("192.0.2.1", "a")];
+        for (client_ip, account) in load {
+            let response = actix_test::call_service(&app, call(client_ip, get_accounts(account)).to_request()).await;
+            assert_eq!(response.status(), 200);
+        }
+
+        let entries = read_access_log(&log_path);
+        assert_eq!(entries.len(), load.len());
+        let mut backend_seconds: HashMap<String, f64> = HashMap::new();
+        for entry in &entries {
+            let response_bytes = entry["response_bytes"].as_u64().unwrap();
+            assert_eq!(response_bytes, BACKEND_RESULT_BYTES as u64 + 2, "the quoted string result: {entry}");
+            *backend_seconds.entry(entry["client_net"].as_str().unwrap().to_string()).or_default() += entry["backend_time"].as_f64().unwrap_or(0.0);
+        }
+        let hit = entries.last().unwrap();
+        assert_eq!(hit["client_net"], "192.0.2.0/24", "X-Forwarded-For, not the peer 10.0.0.1, is keyed");
+        assert_eq!(hit["cache_hit"], true);
+        assert_eq!(hit["backend_time"], Value::Null);
+        assert_eq!(entries[3]["client_net"], "2001:db8:1:2::/64");
+
+        let response = actix_test::call_service(&app, actix_test::TestRequest::get().uri("/metrics").to_request()).await;
+        let metrics = String::from_utf8(actix_test::read_body(response).await.to_vec()).unwrap();
+        let seconds = client_net_series(&metrics, "client_net_backend_seconds_total");
+        let requests = client_net_series(&metrics, "client_net_requests_total");
+        let bytes = client_net_series(&metrics, "client_net_response_bytes_total");
+        let mut labels: Vec<&str> = seconds.keys().map(String::as_str).collect();
+        labels.sort();
+        assert_eq!(labels, ["2001:db8:1:2::/64", "203.0.113.0/24", "other"], "{metrics}");
+        assert_eq!(requests["203.0.113.0/24"], 3.0);
+        assert_eq!(requests["2001:db8:1:2::/64"], 2.0);
+        assert_eq!(requests["other"], 2.0);
+        assert_eq!(bytes["203.0.113.0/24"], 3.0 * (BACKEND_RESULT_BYTES as f64 + 2.0));
+        for network in ["203.0.113.0/24", "2001:db8:1:2::/64"] {
+            assert!((seconds[network] - backend_seconds[network]).abs() < 1e-9, "{network}: {seconds:?} vs {backend_seconds:?}");
+        }
+        assert!((seconds["other"] - backend_seconds["198.51.100.0/24"]).abs() < 1e-9);
+        assert!(seconds["203.0.113.0/24"] >= 0.15);
+    }
+
+    #[actix_web::test]
+    async fn client_cost_off_adds_no_log_fields_or_metrics() {
+        let (backend_url, _) = start_backend();
+        let (data, log_path) = with_access_log(app_data_with(&backend_url, "{}", "metrics_enabled: true, client_cost_metrics: false"));
+        assert!(data.client_costs.is_none());
+        let app = actix_test::init_service(App::new()
+            .wrap(RequestIdentifier::with_uuid())
+            .app_data(data.clone())
+            .route("/", web::post().to(api_call))
+            .route("/metrics", web::get().to(metrics_handler))).await;
+        let response = actix_test::call_service(&app, call("203.0.113.7", get_accounts("a")).to_request()).await;
+        assert_eq!(response.status(), 200);
+
+        let entries = read_access_log(&log_path);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["backend_time"].is_f64());
+        assert!(entries[0].get("client_net").is_none() && entries[0].get("response_bytes").is_none(), "{}", entries[0]);
+        let response = actix_test::call_service(&app, actix_test::TestRequest::get().uri("/metrics").to_request()).await;
+        let metrics = String::from_utf8(actix_test::read_body(response).await.to_vec()).unwrap();
+        assert!(metrics.contains("drone_test_requests_total"), "{metrics}");
+        assert!(!metrics.contains("client_net"), "{metrics}");
     }
 }
