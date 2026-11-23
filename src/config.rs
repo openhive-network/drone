@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
 use sequence_trie::SequenceTrie;
-use serde::{Deserialize};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TtlValue {
@@ -15,20 +14,37 @@ pub enum TtlValue {
     /// For `get_account_history`: cache for `fixed_seconds` if the page is complete and
     /// irreversible (see `account_history::classify_page`).  Otherwise, cache for the fallback
     /// number of seconds
-    ExpireIfReversibleHistory { fallback_seconds: u32, fixed_seconds: u32 },
+    ExpireIfReversibleHistory {
+        fallback_seconds: u32,
+        fixed_seconds: u32,
+    },
     /// Expect the upstream server to tell us how long to cache via a `Cache-Control: max-age=`  HTTP header
     HonorUpstreamCacheControl,
     /// Cache response for a fixed amount of time
-    DurationInSeconds(u32)
+    DurationInSeconds(u32),
 }
 
-fn default_to_true() -> bool { true }
-fn default_metrics_path() -> String { "/metrics".to_string() }
-fn default_metrics_namespace() -> String { "drone".to_string() }
-fn default_access_log_format() -> String { "simple".to_string() }
-fn default_empty_string() -> String { String::new() }
-fn default_client_cost_top_networks() -> usize { 20 }
-fn default_client_cost_window_seconds() -> u64 { 300 }
+fn default_to_true() -> bool {
+    true
+}
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
+}
+fn default_metrics_namespace() -> String {
+    "drone".to_string()
+}
+fn default_access_log_format() -> String {
+    "simple".to_string()
+}
+fn default_empty_string() -> String {
+    String::new()
+}
+fn default_client_cost_top_networks() -> usize {
+    20
+}
+fn default_client_cost_window_seconds() -> u64 {
+    300
+}
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -109,8 +125,9 @@ pub struct DroneConfig {
     pub client_cost_window_seconds: u64,
 }
 
-
-fn default_cost_limit_window_seconds() -> u64 { 60 }
+fn default_cost_limit_window_seconds() -> u64 {
+    60
+}
 
 /// Per-client-network budget for the backend cost of cache misses.  Read from the optional
 /// top-level `cost_limit` section; see `cost_limit::CostLimiter` for how it is enforced.
@@ -175,8 +192,8 @@ impl AppConfig {
     }
     pub fn lookup_equivalent_method(&self, original_method_name: String) -> String {
         match self.equivalent_methods.get(&original_method_name) {
-            Some(replacement_method_name) => { replacement_method_name.clone() }
-            None => { original_method_name }
+            Some(replacement_method_name) => replacement_method_name.clone(),
+            None => original_method_name,
         }
     }
 }
@@ -194,7 +211,9 @@ enum YamlSpecialTtlValue {
 /// Fixed history pages are not cached forever: the backend's account-operation numbering can
 /// change under drone (e.g. a HAF upgrade or replay, hive#867), and a bounded TTL corrects that.
 const DEFAULT_HISTORY_FIXED_SECONDS: u32 = 3600;
-fn default_history_fixed_seconds() -> u32 { DEFAULT_HISTORY_FIXED_SECONDS }
+fn default_history_fixed_seconds() -> u32 {
+    DEFAULT_HISTORY_FIXED_SECONDS
+}
 
 /// Written in YAML as `EXPIRE_IF_REVERSIBLE_HISTORY: <fallback seconds>`, optionally with
 /// `fixed_seconds: <seconds>` in the same mapping
@@ -212,18 +231,25 @@ struct YamlHistoryTtlValue {
 enum YamlTtlValue {
     SpecialValue(YamlSpecialTtlValue),
     HistoryValue(YamlHistoryTtlValue),
-    DurationInSeconds(u32)
+    DurationInSeconds(u32),
 }
 
 /// and a helper function to hide the ugliness
 fn ttl_value_from_yaml(ttl: &YamlTtlValue) -> TtlValue {
     match ttl {
-        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoCache) => { TtlValue::NoCache }
-        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoExpire) => { TtlValue::NoExpire }
-        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::ExpireIfReversible) => { TtlValue::ExpireIfReversible }
-        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::HonorUpstreamCacheControl) => { TtlValue::HonorUpstreamCacheControl }
-        YamlTtlValue::HistoryValue(history) => { TtlValue::ExpireIfReversibleHistory { fallback_seconds: history.fallback_seconds, fixed_seconds: history.fixed_seconds } }
-        YamlTtlValue::DurationInSeconds(n) => { TtlValue::DurationInSeconds(*n) } 
+        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoCache) => TtlValue::NoCache,
+        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::NoExpire) => TtlValue::NoExpire,
+        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::ExpireIfReversible) => {
+            TtlValue::ExpireIfReversible
+        }
+        YamlTtlValue::SpecialValue(YamlSpecialTtlValue::HonorUpstreamCacheControl) => {
+            TtlValue::HonorUpstreamCacheControl
+        }
+        YamlTtlValue::HistoryValue(history) => TtlValue::ExpireIfReversibleHistory {
+            fallback_seconds: history.fallback_seconds,
+            fixed_seconds: history.fixed_seconds,
+        },
+        YamlTtlValue::DurationInSeconds(n) => TtlValue::DurationInSeconds(*n),
     }
 }
 
@@ -262,11 +288,10 @@ fn deep_merge(base: &mut serde_yaml::Value, override_val: serde_yaml::Value) {
 
 pub fn parse_file(filename: &str) -> AppConfig {
     // Parse the base YAML config
-    let yaml_string = fs::read_to_string(filename)
-        .expect("Unable to read file");
+    let yaml_string = fs::read_to_string(filename).expect("Unable to read file");
 
-    let mut yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml_string)
-        .expect("Unable to parse YAML");
+    let mut yaml_value: serde_yaml::Value =
+        serde_yaml::from_str(&yaml_string).expect("Unable to parse YAML");
 
     // If a local override file exists, deep-merge it on top of the base config.
     // This allows operators to keep deployment-specific settings (metrics, logging, etc.)
@@ -279,12 +304,30 @@ pub fn parse_file(filename: &str) -> AppConfig {
         eprintln!("Merged local config from {}", local_filename);
     }
 
-    let config: YamlConfig = serde_yaml::from_value(yaml_value)
-        .expect("Unable to parse config");
+    let config: YamlConfig = serde_yaml::from_value(yaml_value).expect("Unable to parse config");
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false, client_cost_metrics: true, client_cost_top_networks: default_client_cost_top_networks(), client_cost_window_seconds: default_client_cost_window_seconds()},
+        drone: DroneConfig {
+            port: 80,
+            hostname: "0.0.0.0".to_string(),
+            cache_max_capacity: 4 << 30,
+            operator_message: "Drone by Deathwing".to_string(),
+            middleware_connection_threads: 8,
+            add_cors_headers: true,
+            add_jussi_headers: false,
+            access_log_format: "simple".to_string(),
+            access_log_file: String::new(),
+            access_log_flush_every_line: false,
+            trust_forwarded_for: false,
+            metrics_enabled: true,
+            metrics_path: "/metrics".to_string(),
+            metrics_namespace: "drone".to_string(),
+            debug_endpoints_enabled: false,
+            client_cost_metrics: true,
+            client_cost_top_networks: default_client_cost_top_networks(),
+            client_cost_window_seconds: default_client_cost_window_seconds(),
+        },
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),
@@ -306,15 +349,25 @@ pub fn parse_file(filename: &str) -> AppConfig {
     // move the urls, resolving the backend names into urls as we go
     for (method, backend_name) in config.urls {
         let parts: Vec<String> = method.split('.').map(|v| v.to_string()).collect();
-        let url = app_config.backends.get(&backend_name).unwrap_or_else(|| panic!("Undefined backend \"{}\" for method \"{}\"", backend_name, method));
-        app_config.urls.insert_owned(parts, BackendInfo {
-            url: url.clone(),
-            name: backend_name,
+        let url = app_config.backends.get(&backend_name).unwrap_or_else(|| {
+            panic!(
+                "Undefined backend \"{}\" for method \"{}\"",
+                backend_name, method
+            )
         });
+        app_config.urls.insert_owned(
+            parts,
+            BackendInfo {
+                url: url.clone(),
+                name: backend_name,
+            },
+        );
     }
     for (method, ttl) in config.ttls {
         let parts: Vec<String> = method.split('.').map(|v| v.to_string()).collect();
-        app_config.ttls.insert_owned(parts, ttl_value_from_yaml(&ttl));
+        app_config
+            .ttls
+            .insert_owned(parts, ttl_value_from_yaml(&ttl));
     }
     for (method, timeout) in config.timeouts {
         let parts: Vec<String> = method.split('.').map(|v| v.to_string()).collect();
@@ -323,7 +376,9 @@ pub fn parse_file(filename: &str) -> AppConfig {
     // flip the equivalent_methods around so we can do a direct source -> target lookup
     for (target_method, source_methods) in config.equivalent_methods {
         for source_method in source_methods {
-            app_config.equivalent_methods.insert(source_method, target_method.clone());
+            app_config
+                .equivalent_methods
+                .insert(source_method, target_method.clone());
         }
     }
     app_config
@@ -339,14 +394,40 @@ mod tests {
 
     #[test]
     fn ttl_values_parse_from_yaml() {
-        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 3600 });
-        assert_eq!(parse_ttl("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_seconds: 600}"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 600 });
-        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6\nfixed_seconds: 600"), TtlValue::ExpireIfReversibleHistory { fallback_seconds: 6, fixed_seconds: 600 });
-        assert_eq!(parse_ttl("EXPIRE_IF_REVERSIBLE"), TtlValue::ExpireIfReversible);
+        assert_eq!(
+            parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6"),
+            TtlValue::ExpireIfReversibleHistory {
+                fallback_seconds: 6,
+                fixed_seconds: 3600
+            }
+        );
+        assert_eq!(
+            parse_ttl("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_seconds: 600}"),
+            TtlValue::ExpireIfReversibleHistory {
+                fallback_seconds: 6,
+                fixed_seconds: 600
+            }
+        );
+        assert_eq!(
+            parse_ttl("EXPIRE_IF_REVERSIBLE_HISTORY: 6\nfixed_seconds: 600"),
+            TtlValue::ExpireIfReversibleHistory {
+                fallback_seconds: 6,
+                fixed_seconds: 600
+            }
+        );
+        assert_eq!(
+            parse_ttl("EXPIRE_IF_REVERSIBLE"),
+            TtlValue::ExpireIfReversible
+        );
         assert_eq!(parse_ttl("NO_CACHE"), TtlValue::NoCache);
         assert_eq!(parse_ttl("6"), TtlValue::DurationInSeconds(6));
-        assert!(serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err());
-        assert!(serde_yaml::from_str::<YamlTtlValue>("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_second: 600}").is_err());
+        assert!(
+            serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err()
+        );
+        assert!(serde_yaml::from_str::<YamlTtlValue>(
+            "{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_second: 600}"
+        )
+        .is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{fixed_seconds: 600}").is_err());
     }
 
@@ -358,6 +439,11 @@ mod tests {
         assert_eq!(cost_limit.backend_seconds, Some(60.0));
         assert_eq!(cost_limit.response_bytes, Some(500_000_000));
         assert!(cost_limit.allowlist.contains(&"10.0.0.0/8".to_string()));
-        assert_eq!(cost_limit.method_weights.get("appbase.condenser_api.get_account_history"), Some(&1.0));
+        assert_eq!(
+            cost_limit
+                .method_weights
+                .get("appbase.condenser_api.get_account_history"),
+            Some(&1.0)
+        );
     }
 }
