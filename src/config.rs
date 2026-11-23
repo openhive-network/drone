@@ -27,6 +27,7 @@ fn default_metrics_path() -> String { "/metrics".to_string() }
 fn default_metrics_namespace() -> String { "drone".to_string() }
 fn default_access_log_format() -> String { "simple".to_string() }
 fn default_empty_string() -> String { String::new() }
+fn default_stream_min_bytes() -> u64 { 1 << 20 }
 
 #[derive(Clone, Deserialize, Debug)]
 #[serde()]
@@ -89,6 +90,17 @@ pub struct DroneConfig {
     /// whether to enable debug endpoints (jemalloc stats, heap profiling)
     #[serde(default)]
     pub debug_endpoints_enabled: bool,
+
+    /// whether backend responses drone will not cache (a `NO_CACHE` method, or a `Content-Length`
+    /// above `stream_min_bytes`) are piped to the client as they arrive instead of being buffered
+    /// and parsed.  Applies to single (non-batch) calls.  Default: true
+    #[serde(default = "default_to_true")]
+    pub stream_uncached_responses: bool,
+
+    /// with `stream_uncached_responses`, a response whose `Content-Length` exceeds this many
+    /// bytes is streamed and not cached, whatever its method's TTL.  Default: 1 MiB
+    #[serde(default = "default_stream_min_bytes")]
+    pub stream_min_bytes: u64,
 }
 
 
@@ -266,7 +278,7 @@ pub fn parse_file(filename: &str) -> AppConfig {
 
     // Then move the data into our AppConfig, into a format that's easier to use at runtime
     let mut app_config = AppConfig {
-        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false},
+        drone: DroneConfig{port: 80, hostname: "0.0.0.0".to_string(), cache_max_capacity: 4 << 30, operator_message: "Drone by Deathwing".to_string(), middleware_connection_threads: 8, add_cors_headers: true, add_jussi_headers: false, access_log_format: "simple".to_string(), access_log_file: String::new(), access_log_flush_every_line: false, trust_forwarded_for: false, metrics_enabled: true, metrics_path: "/metrics".to_string(), metrics_namespace: "drone".to_string(), debug_endpoints_enabled: false, stream_uncached_responses: true, stream_min_bytes: default_stream_min_bytes()},
         backends: HashMap::new(),
         translate_to_appbase: HashSet::new(),
         urls: SequenceTrie::new(),
@@ -330,6 +342,13 @@ mod tests {
         assert!(serde_yaml::from_str::<YamlTtlValue>("EXPIRE_IF_REVERSIBLE_HISTORY_TYPO: 6").is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{EXPIRE_IF_REVERSIBLE_HISTORY: 6, fixed_second: 600}").is_err());
         assert!(serde_yaml::from_str::<YamlTtlValue>("{fixed_seconds: 600}").is_err());
+    }
+
+    #[test]
+    fn example_config_streams_uncached_responses_over_1_mib() {
+        let drone = parse_file("config.example.yaml").drone;
+        assert!(drone.stream_uncached_responses);
+        assert_eq!(drone.stream_min_bytes, 1 << 20);
     }
 
     #[test]

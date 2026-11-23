@@ -12,6 +12,8 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode, middleware::Condition};
+use actix_web::body::{BodySize, MessageBody};
+use actix_web::web::Bytes;
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
@@ -19,9 +21,11 @@ use serde_json::{Value, json, value::RawValue};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 //use actix_web::rt::time::sleep;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use chrono::DateTime;
 use actix_request_identifier::{RequestId, RequestIdentifier, IdReuse};
 use sha256::digest;
@@ -31,7 +35,7 @@ use log::{error, warn, info, debug, trace, log_enabled, Level::Info};
 
 
 pub mod config;
-use config::{AppConfig, TtlValue};
+use config::{AppConfig, BackendInfo, TtlValue};
 
 pub mod method_renamer;
 use method_renamer::MethodAndParams;
@@ -42,7 +46,7 @@ pub mod account_history;
 use account_history::HistoryPage;
 
 pub mod cost_limit;
-use cost_limit::{Admission, CostLimiter};
+use cost_limit::{Admission, CostLimiter, Network};
 use metrics::DroneMetrics;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -53,6 +57,10 @@ const COST_LIMIT_ERROR_CODE: i32 = -32029;
 /// Networks below this fraction of their budget are left out of the usage gauge, which would
 /// otherwise carry a series for every network that made a cache miss in the last window
 const COST_LIMIT_GAUGE_MIN_RATIO: f64 = 0.1;
+
+/// Chunks of a streamed backend response held between the backend and the client; this bounds
+/// how far drone reads ahead of a slow client
+const STREAM_CHANNEL_CHUNKS: usize = 4;
 
 
 struct BlockchainState {
@@ -281,6 +289,67 @@ struct APICallResponse {
     tracking_info: Option<ResponseTrackingInfo>
 }
 
+/// What a call is answered with
+enum Answer {
+    /// a result drone has parsed (and may have cached), to be put in the caller's envelope
+    Result(APICallResponse),
+    /// the backend's response, piped to the client unparsed
+    Streamed(StreamedResponse),
+}
+
+/// A backend response on its way to the client: the backend's status and headers, and a body
+/// that a background task feeds as the backend sends it
+struct StreamedResponse {
+    status: StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: ChannelBody,
+    tracking_info: ResponseTrackingInfo,
+}
+
+/// A response body fed chunk by chunk through a channel
+struct ChannelBody {
+    chunks: mpsc::Receiver<io::Result<Bytes>>,
+    size: BodySize,
+}
+
+impl MessageBody for ChannelBody {
+    type Error = io::Error;
+
+    fn size(&self) -> BodySize {
+        self.size
+    }
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        self.get_mut().chunks.poll_recv(cx)
+    }
+}
+
+/// A backend response whose body has not been read yet
+struct UpstreamStream {
+    response: reqwest::Response,
+    backend_name: String,
+    started: Instant,
+}
+
+/// How the answer to a call reached drone
+enum Fetched {
+    /// parsed into a cache entry (from the cache, or read whole from the backend)
+    Buffered(CacheEntry),
+    /// a backend response whose body is still to be read
+    Streamed(UpstreamStream),
+}
+
+/// Why a cache-filling backend call produced no cache entry: its response is streamed instead
+#[derive(Debug)]
+struct StreamedInstead;
+
+/// Headers of a backend response that describe the backend connection, not the response
+fn is_hop_by_hop_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(name.as_str(),
+        "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization"
+        | "te" | "trailer" | "transfer-encoding" | "upgrade" | "content-length")
+}
+
 /// Forces deserialization of the inner Option so that JSON `null` becomes `Some(None)` rather
 /// than being swallowed as the outer `None`. Combined with `#[serde(default)]` (absent key ->
 /// outer `None`), this lets `result` distinguish three cases:
@@ -430,13 +499,13 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
     }
 }
 
-async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, request_id: &RequestId) -> CacheEntry {
-    let backend_start = Instant::now();
-
+/// Sends the call to its backend, with `upstream_id` as its JSON-RPC id.  The `Err` is the cache
+/// entry that answers the call when no backend takes it or the request cannot be sent
+async fn send_to_upstream<'a>(data: &'a AppData, mapped_method: &MethodAndParams, method_and_params_str: &str, upstream_id: ID, backend_start: Instant, request_id: &RequestId) -> Result<(reqwest::Response, &'a BackendInfo), CacheEntry> {
     let backend = match data.config.lookup_backend(mapped_method.get_method_name_parts()) {
         Some(backend) => { backend }
         None => {
-            return CacheEntry {
+            return Err(CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
                         "code": -32603, // or 32601?
@@ -448,30 +517,31 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
-            };
+            });
         }
     };
 
-    let upstream_request = mapped_method.format_for_upstream(&data.config);
+    let mut upstream_request = mapped_method.format_for_upstream(&data.config);
+    upstream_request.id = upstream_id;
     debug!(request_id=request_id.as_str(); "Making upstream request for {method_and_params_str}");
     // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
 
     // Send the request to the endpoints.
-    let res = match client
+    match client
         .post(&backend.url)
         .json(&upstream_request)
         .send()
         .await
     {
-        Ok(response) => response,
+        Ok(response) => Ok((response, backend)),
         Err(err) => {
             let mut error_message = err.without_url().to_string();
             error_message.push_str(&backend.url);
             debug!(request_id=request_id.as_str(); "Error making updstream request: {error_message}");
             let backend_duration_secs = backend_start.elapsed().as_secs_f64();
-            return CacheEntry {
+            Err(CacheEntry {
                 result: Err(ErrorData {
                     error: json!({
                         "code": -32700,
@@ -483,10 +553,39 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
-            };
+            })
         }
-    };
+    }
+}
 
+/// Calls the backend for a call whose response may be cached.  With `stream_above`, a response
+/// whose `Content-Length` exceeds it is returned unread as the `Err`, to be streamed and not cached
+async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String, upstream_id: ID, stream_above: Option<u64>, request_id: &RequestId) -> Result<CacheEntry, UpstreamStream> {
+    let backend_start = Instant::now();
+    let (res, backend) = match send_to_upstream(&data, &mapped_method, &method_and_params_str, upstream_id, backend_start, request_id).await {
+        Ok(sent) => sent,
+        Err(cache_entry) => return Ok(cache_entry),
+    };
+    if let (Some(limit), Some(length)) = (stream_above, res.content_length()) {
+        if length > limit {
+            debug!(request_id=request_id.as_str(); "{method_and_params_str}: response of {length} bytes is over stream_min_bytes, streaming it uncached");
+            return Err(UpstreamStream { response: res, backend_name: backend.name.clone(), started: backend_start });
+        }
+    }
+    Ok(buffer_upstream_response(&data, &mapped_method, &method_and_params_str, res, backend, backend_start, request_id).await)
+}
+
+/// Calls the backend for a call whose response is streamed to the client
+async fn stream_from_upstream(data: &AppData, mapped_method: &MethodAndParams, method_and_params_str: &str, upstream_id: ID, request_id: &RequestId) -> Fetched {
+    let backend_start = Instant::now();
+    match send_to_upstream(data, mapped_method, method_and_params_str, upstream_id, backend_start, request_id).await {
+        Ok((response, backend)) => Fetched::Streamed(UpstreamStream { response, backend_name: backend.name.clone(), started: backend_start }),
+        Err(cache_entry) => Fetched::Buffered(cache_entry),
+    }
+}
+
+/// Reads and parses a backend response into the cache entry for the call
+async fn buffer_upstream_response(data: &AppData, mapped_method: &MethodAndParams, method_and_params_str: &str, res: reqwest::Response, backend: &BackendInfo, backend_start: Instant, request_id: &RequestId) -> CacheEntry {
     // to simulate slow calls, put a sleep here
     // sleep(Duration::from_secs(10)).await;
 
@@ -706,6 +805,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 }
 
 /// Build a JSON access log entry for file logging
+#[allow(clippy::too_many_arguments)]
 fn build_access_log_json(
     client_ip: &str,
     mapped_method: &MethodAndParams,
@@ -713,8 +813,9 @@ fn build_access_log_json(
     backend_time: Option<f64>,
     cached: bool,
     request_body_json: &str,
-    request_id: &RequestId,
+    request_id: &str,
     status: u16,
+    response_bytes: Option<u64>,
 ) -> Value {
     let now = chrono::Local::now();
     let time_local = now.format("%d/%b/%Y:%H:%M:%S %z").to_string();
@@ -730,12 +831,151 @@ fn build_access_log_json(
         "request_time": duration_seconds,
         "backend_time": backend_time,
         "cache_hit": cached,
+        "response_bytes": response_bytes,
         "request_body": request_body_json,
-        "request_id": request_id.as_str()
+        "request_id": request_id
     })
 }
 
-async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId) -> Result<APICallResponse, ErrorStructure> {
+/// Writes the access log entry of a finished call to the access log file, if configured, and to
+/// the console when the access log format is "json"
+#[allow(clippy::too_many_arguments)]
+fn write_access_log(
+    data: &AppData,
+    client_ip: &str,
+    mapped_method: &MethodAndParams,
+    duration_seconds: f64,
+    backend_time: Option<f64>,
+    cached: bool,
+    request_body_json: &str,
+    request_id: &str,
+    status: u16,
+    response_bytes: Option<u64>,
+) {
+    // Write to access log file if configured (always JSON format)
+    if let Some(ref writer) = data.access_log_writer {
+        let log_entry = build_access_log_json(client_ip, mapped_method, duration_seconds, backend_time, cached, request_body_json, request_id, status, response_bytes);
+        if let Ok(mut w) = writer.lock() {
+            let _ = writeln!(w, "{}", log_entry);
+            if data.access_log_flush_every_line {
+                let _ = w.flush();
+            }
+        }
+    }
+
+    // JSON access log format for console (logs after request processing with full details)
+    if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
+        let log_entry = build_access_log_json(client_ip, mapped_method, duration_seconds, backend_time, cached, request_body_json, request_id, status, response_bytes);
+        info!(target: "access_log", "{}", log_entry);
+    }
+}
+
+/// The request body as the JSON access log records it; empty when no JSON access log is written
+fn access_log_request_body(data: &AppData, request: &APIRequest) -> String {
+    let needs_json_logging = data.config.drone.access_log_format == "json" || data.access_log_writer.is_some();
+    if needs_json_logging {
+        serde_json::to_string(request).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// The debug headers' description of a call
+fn tracking_info(data: &AppData, mapped_method: MethodAndParams, cached: bool) -> ResponseTrackingInfo {
+    let backend_url = data.config.lookup_backend(mapped_method.get_method_name_parts()).map(|b| b.url.clone());
+    let upstream_method = mapped_method.format_for_upstream(&data.config).method;
+    ResponseTrackingInfo {
+        cached,
+        mapped_method,
+        backend_url,
+        upstream_method: Some(upstream_method),
+    }
+}
+
+/// What a streamed call is recorded with once its body has been sent
+struct StreamAccounting {
+    data: web::Data<AppData>,
+    mapped_method: MethodAndParams,
+    client_ip: String,
+    request_id: String,
+    request_body_json: String,
+    request_start: Instant,
+    /// the network the backend cost is charged to
+    network: Option<Network>,
+}
+
+impl StreamAccounting {
+    /// Records a streamed call: `complete` is false when the backend or the client ended the
+    /// transfer early, after `bytes` bytes
+    fn record(self, backend_name: &str, status: StatusCode, complete: bool, backend_seconds: f64, bytes: u64) {
+        let data = &self.data;
+        let mapped_method = &self.mapped_method;
+        let api = mapped_method.api.as_deref().unwrap_or("");
+        let duration_seconds = self.request_start.elapsed().as_secs_f64();
+
+        data.metrics.record_backend_duration(&mapped_method.namespace, api, &mapped_method.method, backend_name, backend_seconds);
+        data.metrics.record_streamed_response(&mapped_method.namespace, api, &mapped_method.method, bytes);
+        if status.is_success() && complete {
+            data.metrics.record_request_success(&mapped_method.namespace, api, &mapped_method.method, false, duration_seconds);
+        } else {
+            data.metrics.record_request_error(&mapped_method.namespace, api, &mapped_method.method, -32603, false, duration_seconds);
+        }
+        data.metrics.dec_active_requests();
+
+        if let (Some(network), Some(limiter)) = (self.network, data.cost_limiter.as_ref()) {
+            limiter.charge(network, mapped_method.get_method_name_parts(), backend_seconds, bytes, Instant::now());
+        }
+
+        write_access_log(data, &self.client_ip, mapped_method, duration_seconds, Some(backend_seconds), false,
+                         &self.request_body_json, &self.request_id, status.as_u16(), Some(bytes));
+    }
+}
+
+/// Starts piping a backend response to the client: a background task copies the backend's body
+/// into the returned response's body as it arrives, and records the call when it is done
+fn stream_to_client(upstream: UpstreamStream, tracking_info: ResponseTrackingInfo, accounting: StreamAccounting) -> StreamedResponse {
+    let status = upstream.response.status();
+    let headers = upstream.response.headers().clone();
+    let size = upstream.response.content_length().map_or(BodySize::Stream, BodySize::Sized);
+    let (chunks, receiver) = mpsc::channel(STREAM_CHANNEL_CHUNKS);
+    tokio::spawn(pump_upstream_body(upstream, chunks, accounting));
+    StreamedResponse {
+        status,
+        headers,
+        body: ChannelBody { chunks: receiver, size },
+        tracking_info,
+    }
+}
+
+async fn pump_upstream_body(mut upstream: UpstreamStream, chunks: mpsc::Sender<io::Result<Bytes>>, accounting: StreamAccounting) {
+    let status = upstream.response.status();
+    let mut bytes: u64 = 0;
+    let complete = loop {
+        match upstream.response.chunk().await {
+            Ok(Some(chunk)) => {
+                bytes += chunk.len() as u64;
+                if chunks.send(Ok(chunk)).await.is_err() {
+                    debug!(request_id=accounting.request_id.as_str(); "Client went away after {bytes} bytes of a streamed response");
+                    break false;
+                }
+            }
+            Ok(None) => break true,
+            Err(err) => {
+                warn!(request_id=accounting.request_id.as_str(); "Backend failed after {bytes} bytes of a streamed response: {err}");
+                // the error aborts the client's response; a client that is already gone needs nothing
+                let _ = chunks.send(Err(io::Error::new(io::ErrorKind::Other, err))).await;
+                break false;
+            }
+        }
+    };
+    let backend_seconds = upstream.started.elapsed().as_secs_f64();
+    drop(upstream.response);
+    accounting.record(&upstream.backend_name, status, complete, backend_seconds, bytes);
+}
+
+/// Answers one call.  With `streamable`, a response drone will not cache may be answered with
+/// the backend's response itself, unparsed (see `stream_uncached_responses`)
+async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String, request_id: &RequestId, streamable: bool) -> Result<Answer, ErrorStructure> {
     let request_start = Instant::now();
     data.metrics.inc_active_requests();
 
@@ -793,17 +1033,28 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     //   config (we just insert them with a TTL of zero).  That may cause some 
     //   unnecessary/unwanted effects, but so far performance seems to be the same compared to
     //   an alternate implementation where the caching and combining were handled separately.
+    // - streamed responses (see stream_uncached_responses) bypass the cache: NO_CACHE calls do
+    //   not go through it at all, and a response over stream_min_bytes is not inserted, so
+    //   the calls that waited for it make their own backend call
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
     let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
     let admission = data.cost_limiter.as_ref().map_or(Admission::Exempt, |limiter| limiter.admit(client_ip, Instant::now()));
 
+    // get_dynamic_global_properties is never streamed: drone reads the chain state from its result
+    let stream_above = (streamable && data.config.drone.stream_uncached_responses && mapped_method.method != "get_dynamic_global_properties")
+        .then_some(data.config.drone.stream_min_bytes);
+    // a streamed response reaches the client with the backend's JSON-RPC id, so the backend gets
+    // the caller's id
+    let upstream_id = if stream_above.is_some() { request.id.clone() } else { ID::Int(1) };
+    let uncacheable = matches!(data.config.lookup_ttl(mapped_method.get_method_name_parts()), None | Some(TtlValue::NoCache));
+
     let mut upstream_was_called = false;
-    let cache_entry = match admission {
+    let fetched = match admission {
         Admission::Throttled { network, retry_after } => {
             // an over-budget network is still served from the cache, since hits cost the backend nothing
             match data.cache.get(&method_and_params_str).await {
-                Some(cache_entry) => cache_entry,
+                Some(cache_entry) => Fetched::Buffered(cache_entry),
                 None => {
                     data.metrics.dec_active_requests();
                     let network = network.to_string();
@@ -822,9 +1073,42 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
                 }
             }
         }
+        Admission::Exempt | Admission::Allowed(_) if stream_above.is_some() && uncacheable => {
+            stream_from_upstream(data, &mapped_method, &method_and_params_str, upstream_id, request_id).await
+        }
         Admission::Exempt | Admission::Allowed(_) => {
-            data.cache.get_with_by_ref(&method_and_params_str,
-                                       async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), request_id).await }).await
+            let mut oversized = None;
+            let cached = data.cache.try_get_with_by_ref(&method_and_params_str, async {
+                upstream_was_called = true;
+                request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone(), upstream_id.clone(), stream_above, request_id).await
+                    .map_err(|upstream| { oversized = Some(upstream); StreamedInstead })
+            }).await;
+            match (cached, oversized) {
+                (Ok(cache_entry), _) => Fetched::Buffered(cache_entry),
+                (Err(_), Some(upstream)) => Fetched::Streamed(upstream),
+                // another call's backend response was over stream_min_bytes, and is streamed to it
+                (Err(_), None) => stream_from_upstream(data, &mapped_method, &method_and_params_str, upstream_id, request_id).await,
+            }
+        }
+    };
+
+    let cache_entry = match fetched {
+        Fetched::Buffered(cache_entry) => cache_entry,
+        Fetched::Streamed(upstream) => {
+            let network = match admission {
+                Admission::Allowed(network) => Some(network),
+                Admission::Exempt | Admission::Throttled { .. } => None,
+            };
+            let accounting = StreamAccounting {
+                data: data.clone(),
+                mapped_method: mapped_method.clone(),
+                client_ip: client_ip.clone(),
+                request_id: request_id.as_str().to_string(),
+                request_body_json: access_log_request_body(data, &request),
+                request_start,
+                network,
+            };
+            return Ok(Answer::Streamed(stream_to_client(upstream, tracking_info(data, mapped_method, false), accounting)));
         }
     };
 
@@ -840,13 +1124,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     data.metrics.dec_active_requests();
 
     // Serialize request body early for JSON access logging (before request is moved)
-    // Needed for both console JSON logging and file logging
-    let needs_json_logging = data.config.drone.access_log_format == "json" || data.access_log_writer.is_some();
-    let request_body_json = if needs_json_logging {
-        serde_json::to_string(&request).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let request_body_json = access_log_request_body(data, &request);
 
     match cache_entry.result {
         Ok(api_call_response) => {
@@ -864,58 +1142,16 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             );
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
-
-            // Write to access log file if configured (always JSON format)
-            if let Some(ref writer) = data.access_log_writer {
-                let log_entry = build_access_log_json(
-                    client_ip,
-                    &mapped_method,
-                    duration_seconds,
-                    backend_time,
-                    cached,
-                    &request_body_json,
-                    request_id,
-                    200,
-                );
-                if let Ok(mut w) = writer.lock() {
-                    let _ = writeln!(w, "{}", log_entry);
-                    if data.access_log_flush_every_line {
-                        let _ = w.flush();
-                    }
-                }
-            }
-
-            // JSON access log format for console (logs after request processing with full details)
-            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
-                let log_entry = build_access_log_json(
-                    client_ip,
-                    &mapped_method,
-                    duration_seconds,
-                    backend_time,
-                    cached,
-                    &request_body_json,
-                    request_id,
-                    200,
-                );
-                info!(target: "access_log", "{}", log_entry);
-            }
+            write_access_log(data, client_ip, &mapped_method, duration_seconds, backend_time, cached,
+                             &request_body_json, request_id.as_str(), 200, Some(api_call_response.result_json.len() as u64));
 
             // Construct tracking_info from mapped_method (not from cache entry)
-            let backend = data.config.lookup_backend(mapped_method.get_method_name_parts());
-            let upstream_method = mapped_method.format_for_upstream(&data.config).method;
-            let tracking_info = ResponseTrackingInfo {
-                cached,
-                mapped_method,
-                backend_url: backend.map(|b| b.url.clone()),
-                upstream_method: Some(upstream_method),
-            };
-
-            Ok(APICallResponse {
+            Ok(Answer::Result(APICallResponse {
                 jsonrpc: request.jsonrpc,
                 id: request.id,
                 result_json: api_call_response.result_json,
-                tracking_info: Some(tracking_info),
-            })
+                tracking_info: Some(tracking_info(data, mapped_method, cached)),
+            }))
         }
         Err(error_data) => {
             trace!(request_id=request_id.as_str(); "Result was an error response, upstream_was_called = {upstream_was_called}, http status should be {}", error_data.http_status);
@@ -945,42 +1181,8 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             );
 
             let backend_time: Option<f64> = if cached { None } else { backend_duration_secs };
-            let http_status = error_http_status.as_u16();
-
-            // Write to access log file if configured (always JSON format)
-            if let Some(ref writer) = data.access_log_writer {
-                let log_entry = build_access_log_json(
-                    client_ip,
-                    &mapped_method,
-                    duration_seconds,
-                    backend_time,
-                    cached,
-                    &request_body_json,
-                    request_id,
-                    http_status,
-                );
-                if let Ok(mut w) = writer.lock() {
-                    let _ = writeln!(w, "{}", log_entry);
-                    if data.access_log_flush_every_line {
-                        let _ = w.flush();
-                    }
-                }
-            }
-
-            // JSON access log format for console (logs after request processing with full details)
-            if data.config.drone.access_log_format == "json" && log_enabled!(target: "access_log", Info) {
-                let log_entry = build_access_log_json(
-                    client_ip,
-                    &mapped_method,
-                    duration_seconds,
-                    backend_time,
-                    cached,
-                    &request_body_json,
-                    request_id,
-                    http_status,
-                );
-                info!(target: "access_log", "{}", log_entry);
-            }
+            write_access_log(data, client_ip, &mapped_method, duration_seconds, backend_time, cached,
+                             &request_body_json, request_id.as_str(), error_http_status.as_u16(), None);
 
             Err(response)
         }
@@ -1055,9 +1257,20 @@ async fn api_call(
 
     match call.0 {
         APICall::Single(request) => {
-            let result = handle_request(request, &data, &user_ip, &request_id).await;
+            let result = handle_request(request, &data, &user_ip, &request_id, true).await;
             match result {
-                Ok(response) => {
+                Ok(Answer::Streamed(streamed)) => {
+                    let mut reply_builder = HttpResponse::build(streamed.status);
+                    for (name, value) in streamed.headers.iter().filter(|(name, _)| !is_hop_by_hop_header(name)) {
+                        reply_builder.append_header((name.clone(), value.clone()));
+                    }
+                    reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if data.config.drone.add_jussi_headers {
+                        streamed.tracking_info.into_headers(&mut reply_builder);
+                    }
+                    reply_builder.body(streamed.body)
+                },
+                Ok(Answer::Result(response)) => {
                     let mut reply_builder = HttpResponse::Ok();
                     reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
                     if data.config.drone.add_jussi_headers {
@@ -1110,9 +1323,10 @@ async fn api_call(
             // a batch answers 200 with per-request errors; Retry-After covers its throttled requests
             let mut retry_after: Option<u64> = None;
             for request in requests {
-                let result = handle_request(request, &data, &user_ip, &request_id).await;
+                let result = handle_request(request, &data, &user_ip, &request_id, false).await;
                 match result {
-                    Ok(response) => {
+                    Ok(Answer::Streamed(_)) => unreachable!("batch calls are handled without streaming"),
+                    Ok(Answer::Result(response)) => {
                         if !response.tracking_info.map_or(false, |v| v.cached) {
                             cached = false;
                         }
@@ -1319,14 +1533,17 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, resolve_client_ip, AppData, BlockchainState, CacheTtl, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
+    use super::{api_call, build_cache, config, history_page_ttl, is_block_result_empty, resolve_client_ip, AppData, BlockchainState, CacheTtl, ChannelBody, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse};
     use actix_request_identifier::RequestIdentifier;
+    use actix_web::body::{BodySize, MessageBody};
+    use actix_web::web::Bytes;
     use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
     use serde_json::{json, Value};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::RwLock;
+    use tokio::sync::{mpsc, RwLock};
 
     /// The moka expiry the TTL maps to: `None` never expires, `Some(ZERO)` is not cached
     fn expiry(ttl: CacheTtl) -> Option<Duration> {
@@ -1419,16 +1636,25 @@ mod tests {
     /// Starts a backend answering every call with a string result of `BACKEND_RESULT_BYTES`
     /// characters, and returns its URL and its call counter
     fn start_backend() -> (String, Arc<AtomicUsize>) {
+        start_backend_with(|_| HttpResponse::Ok().content_type("application/json")
+            .body(format!(r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#, "x".repeat(BACKEND_RESULT_BYTES))))
+    }
+
+    /// Starts a backend answering every call (its JSON body) with `reply`, and returns its URL
+    /// and its call counter
+    fn start_backend_with<F>(reply: F) -> (String, Arc<AtomicUsize>)
+    where F: Fn(Value) -> HttpResponse + Clone + Send + 'static {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_server = calls.clone();
         let server = HttpServer::new(move || {
             let calls = calls_for_server.clone();
-            App::new().route("/", web::post().to(move || {
+            let reply = reply.clone();
+            App::new().route("/", web::post().to(move |body: web::Json<Value>| {
                 let calls = calls.clone();
+                let reply = reply.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    HttpResponse::Ok().content_type("application/json")
-                        .body(format!(r#"{{"jsonrpc":"2.0","result":"{}","id":1}}"#, "x".repeat(BACKEND_RESULT_BYTES)))
+                    reply(body.into_inner())
                 }
             }))
         })
@@ -1440,14 +1666,19 @@ mod tests {
     }
 
     fn app_data(backend_url: &str, cost_limit_yaml: &str) -> web::Data<AppData> {
+        app_data_with(backend_url, "", "{appbase: 60}", cost_limit_yaml)
+    }
+
+    /// `drone_options` are extra `drone` settings, each followed by a comma
+    fn app_data_with(backend_url: &str, drone_options: &str, ttls_yaml: &str, cost_limit_yaml: &str) -> web::Data<AppData> {
         static CONFIG_FILES: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!("drone-cost-limit-test-{}-{}.yaml", std::process::id(), CONFIG_FILES.fetch_add(1, Ordering::SeqCst)));
         std::fs::write(&path, format!(r#"
-drone: {{port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true}}
+drone: {{{drone_options} port: 0, hostname: 127.0.0.1, cache_max_capacity: 10000000, operator_message: test, middleware_connection_threads: 1, add_jussi_headers: true, trust_forwarded_for: true}}
 backends: {{hived: "{backend_url}"}}
 translate_to_appbase: []
 urls: {{appbase: hived}}
-ttls: {{appbase: 60}}
+ttls: {ttls_yaml}
 timeouts: {{appbase: 3}}
 equivalent_methods: {{}}
 cost_limit: {cost_limit_yaml}
@@ -1544,5 +1775,224 @@ cost_limit: {cost_limit_yaml}
             assert_eq!(response.status(), 200);
         }
         assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+    }
+
+    const NO_CACHE_TTLS: &str = "{appbase: 60, appbase.condenser_api.get_account_history: NO_CACHE}";
+
+    fn get_account_history(id: u32) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "condenser_api.get_account_history", "params": ["a", -1, 1000]})
+    }
+
+    /// The body the stub backend answers with: a string result of `result_bytes` characters, in a
+    /// layout (key order, spaces) that drone's own envelope never has
+    fn backend_body(id: &Value, result_bytes: usize) -> String {
+        format!(r#"{{"id": {id}, "jsonrpc": "2.0", "result": "{}"}}"#, "x".repeat(result_bytes))
+    }
+
+    /// A backend echoing the caller's id with a result of 1000 characters, or 5000 for the
+    /// account "big", and an `X-Backend` header; it records the ids it was called with
+    fn start_echo_backend() -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let ids_for_server = ids.clone();
+        let (url, calls) = start_backend_with(move |call: Value| {
+            ids_for_server.lock().unwrap().push(call["id"].clone());
+            let result_bytes = if call["params"] == json!([["big"]]) { 5000 } else { BACKEND_RESULT_BYTES };
+            HttpResponse::Ok().content_type("application/json").insert_header(("X-Backend", "stub"))
+                .body(backend_body(&call["id"], result_bytes))
+        });
+        (url, calls, ids)
+    }
+
+    fn drone(data: &web::Data<AppData>) -> App<impl actix_web::dev::ServiceFactory<actix_web::dev::ServiceRequest, Config = (), Response = actix_web::dev::ServiceResponse, Error = actix_web::Error, InitError = ()>> {
+        App::new()
+            .wrap(RequestIdentifier::with_uuid())
+            .app_data(data.clone())
+            .route("/", web::post().to(api_call))
+    }
+
+    #[actix_web::test]
+    async fn uncacheable_response_is_piped_through_verbatim_with_the_callers_id() {
+        let (backend_url, backend_calls, ids) = start_echo_backend();
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        for id in [42, 43] {
+            let response = actix_test::call_service(&app, call("203.0.113.7", get_account_history(id)).to_request()).await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers().get("X-Backend").unwrap(), "stub");
+            assert_eq!(response.headers().get("X-Jussi-Cache-Hit").unwrap(), "false");
+            assert!(response.headers().contains_key("Drone-Version"));
+            let body = actix_test::read_body(response).await;
+            assert_eq!(body, backend_body(&json!(id), BACKEND_RESULT_BYTES).as_bytes());
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*ids.lock().unwrap(), vec![json!(42), json!(43)]);
+
+        let metrics = data.metrics.encode();
+        let labels = r#"api="condenser_api",method="get_account_history",namespace="appbase""#;
+        assert!(metrics.contains(&format!("drone_test_streamed_response_bytes_count{{{labels}}} 2")), "{metrics}");
+        assert!(metrics.contains(&format!("drone_test_streamed_response_bytes_sum{{{labels}}} {}", 2 * backend_body(&json!(42), BACKEND_RESULT_BYTES).len())), "{metrics}");
+        assert!(metrics.contains(r#"drone_test_backend_duration_seconds_count{api="condenser_api",backend="hived",method="get_account_history",namespace="appbase"} 2"#), "{metrics}");
+        assert!(metrics.contains(r#"drone_test_active_requests 0"#), "{metrics}");
+    }
+
+    #[actix_web::test]
+    async fn streamed_backend_errors_keep_their_status_and_body() {
+        let (backend_url, _) = start_backend_with(|_| HttpResponse::BadGateway().body("backend down"));
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        let response = actix_test::call_service(&app, call("203.0.113.7", get_account_history(1)).to_request()).await;
+        assert_eq!(response.status(), 502);
+        assert_eq!(actix_test::read_body(response).await, "backend down");
+    }
+
+    #[actix_web::test]
+    async fn streamed_responses_are_charged_to_the_cost_limit() {
+        let (backend_url, backend_calls, _) = start_echo_backend();
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{enabled: true, window_seconds: 60, response_bytes: 1500}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        for id in [1, 2] {
+            let response = actix_test::call_service(&app, call("203.0.113.7", get_account_history(id)).to_request()).await;
+            assert_eq!(response.status(), 200);
+            actix_test::read_body(response).await;
+        }
+        let response = actix_test::call_service(&app, call("203.0.113.8", get_account_history(3)).to_request()).await;
+        assert_eq!(response.status(), 429);
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[actix_web::test]
+    async fn cacheable_responses_over_stream_min_bytes_are_streamed_and_not_cached() {
+        let (backend_url, backend_calls, ids) = start_echo_backend();
+        let data = app_data_with(&backend_url, "stream_min_bytes: 2000,", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        for id in [7, 8] {
+            let response = actix_test::call_service(&app, call("203.0.113.7", json!({"jsonrpc": "2.0", "id": id, "method": "condenser_api.get_accounts", "params": [["big"]]})).to_request()).await;
+            assert_eq!(response.headers().get("X-Backend").unwrap(), "stub");
+            assert_eq!(actix_test::read_body(response).await, backend_body(&json!(id), 5000).as_bytes());
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+
+        // below the threshold: buffered into drone's envelope, and cached
+        for (id, cache_hit) in [(9, "false"), (10, "true")] {
+            let response = actix_test::call_service(&app, call("203.0.113.7", json!({"jsonrpc": "2.0", "id": id, "method": "condenser_api.get_accounts", "params": [["small"]]})).to_request()).await;
+            assert_eq!(response.headers().get("X-Jussi-Cache-Hit").unwrap(), cache_hit);
+            assert!(!response.headers().contains_key("X-Backend"));
+            let body = actix_test::read_body(response).await;
+            assert_eq!(body, format!(r#"{{"jsonrpc":"2.0","result":"{}","id":{id}}}"#, "x".repeat(BACKEND_RESULT_BYTES)).as_bytes());
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(*ids.lock().unwrap(), vec![json!(7), json!(8), json!(9)]);
+    }
+
+    #[actix_web::test]
+    async fn batch_calls_are_not_streamed() {
+        let (backend_url, _, ids) = start_echo_backend();
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        let response = actix_test::call_service(&app, call("203.0.113.7", json!([get_account_history(5)])).to_request()).await;
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body[0]["id"], 5);
+        assert_eq!(body[0]["result"].as_str().map(str::len), Some(BACKEND_RESULT_BYTES));
+        assert_eq!(*ids.lock().unwrap(), vec![json!(1)]);
+    }
+
+    #[actix_web::test]
+    async fn with_streaming_off_nothing_is_streamed() {
+        let (backend_url, backend_calls, ids) = start_echo_backend();
+        let data = app_data_with(&backend_url, "stream_uncached_responses: false, stream_min_bytes: 2000,", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        let calls = [(get_account_history(3), BACKEND_RESULT_BYTES),
+                     (json!({"jsonrpc": "2.0", "id": 4, "method": "condenser_api.get_accounts", "params": [["big"]]}), 5000)];
+        for (request, result_bytes) in calls {
+            let id = request["id"].clone();
+            let response = actix_test::call_service(&app, call("203.0.113.7", request).to_request()).await;
+            assert!(!response.headers().contains_key("X-Backend"));
+            let body = actix_test::read_body(response).await;
+            assert_eq!(body, format!(r#"{{"jsonrpc":"2.0","result":"{}","id":{id}}}"#, "x".repeat(result_bytes)).as_bytes());
+        }
+        assert_eq!(backend_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*ids.lock().unwrap(), vec![json!(1), json!(1)]);
+    }
+
+    /// A backend answering with a body of `size` bytes that it sends as the test feeds it
+    fn start_paced_backend(size: u64) -> (String, mpsc::Sender<std::io::Result<Bytes>>) {
+        let (sender, receiver) = mpsc::channel(4);
+        let receiver = Arc::new(Mutex::new(Some(receiver)));
+        let (url, _) = start_backend_with(move |_| {
+            let chunks = receiver.lock().unwrap().take().expect("the paced backend answers once");
+            HttpResponse::Ok().content_type("application/json").body(ChannelBody { chunks, size: BodySize::Sized(size) })
+        });
+        (url, sender)
+    }
+
+    async fn next_chunk<B: MessageBody + Unpin>(body: &mut B) -> Option<Bytes> {
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_next(cx)).await.map(|chunk| chunk.ok().expect("a body chunk"))
+    }
+
+    #[actix_web::test]
+    async fn a_streamed_response_reaches_the_client_before_the_backend_has_sent_it_all() {
+        let (backend_url, backend) = start_paced_backend(10);
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+
+        backend.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10),
+            actix_test::call_service(&app, call("203.0.113.7", get_account_history(1)).to_request())).await
+            .expect("the response starts while the backend is still sending");
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body();
+        assert_eq!(body.size(), BodySize::Sized(10));
+        assert_eq!(next_chunk(&mut body).await.as_deref(), Some(&b"first"[..]));
+
+        backend.send(Ok(Bytes::from_static(b"-last"))).await.unwrap();
+        drop(backend);
+        assert_eq!(next_chunk(&mut body).await.as_deref(), Some(&b"-last"[..]));
+        assert_eq!(next_chunk(&mut body).await, None);
+    }
+
+    /// Resident set size of this process (each test runs in its own process under nextest)
+    fn resident_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kib: u64 = status.lines().find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok()).unwrap();
+        kib * 1024
+    }
+
+    #[actix_web::test]
+    async fn streaming_a_large_response_holds_a_small_part_of_it_in_memory() {
+        static CHUNK_BYTES: [u8; 65536] = [b'x'; 65536];
+        const CHUNKS: u64 = 211; // 13.8 MB
+        let size = CHUNKS * CHUNK_BYTES.len() as u64;
+        let (backend_url, backend) = start_paced_backend(size);
+        let data = app_data_with(&backend_url, "", NO_CACHE_TTLS, "{}");
+        let app = actix_test::init_service(drone(&data)).await;
+        tokio::spawn(async move {
+            for _ in 0..CHUNKS {
+                if backend.send(Ok(Bytes::from_static(&CHUNK_BYTES))).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let baseline = resident_bytes();
+        let mut peak = baseline;
+        let response = actix_test::call_service(&app, call("203.0.113.7", get_account_history(1)).to_request()).await;
+        let mut body = response.into_body();
+        let mut received = 0;
+        while let Some(chunk) = next_chunk(&mut body).await {
+            received += chunk.len() as u64;
+            peak = peak.max(resident_bytes());
+        }
+        assert_eq!(received, size);
+        let growth = peak.saturating_sub(baseline);
+        // buffering it (stream_uncached_responses: false) grows resident memory by several times
+        // the response size; streaming by a few MB of fixed buffers and allocator arenas
+        assert!(growth < size / 2, "resident memory grew by {growth} bytes for a {size}-byte response");
     }
 }

@@ -10,6 +10,11 @@ const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
 ];
 
+/// Histogram buckets for the size of streamed responses (in bytes), 64 KiB to 64 MiB
+const STREAMED_RESPONSE_BYTES_BUCKETS: &[f64] = &[
+    65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0
+];
+
 /// DroneMetrics holds all Prometheus metric collectors for Drone
 pub struct DroneMetrics {
     pub registry: Registry,
@@ -22,6 +27,9 @@ pub struct DroneMetrics {
     // Latency histograms
     pub request_duration_seconds: HistogramVec,
     pub backend_duration_seconds: HistogramVec,
+
+    // Responses piped from the backend without buffering
+    pub streamed_response_bytes: HistogramVec,
 
     // Cache gauges
     pub cache_size_bytes: Gauge,
@@ -83,6 +91,16 @@ impl DroneMetrics {
             &["namespace", "api", "method", "backend"]
         ).expect("Failed to create backend_duration_seconds histogram");
 
+        let streamed_response_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "streamed_response_bytes",
+                "Size in bytes of backend responses streamed to the client without being cached"
+            )
+            .namespace(namespace)
+            .buckets(STREAMED_RESPONSE_BYTES_BUCKETS.to_vec()),
+            &["namespace", "api", "method"]
+        ).expect("Failed to create streamed_response_bytes histogram");
+
         // Cache gauges
         let cache_size_bytes = Gauge::new(
             format!("{}_cache_size_bytes", namespace),
@@ -129,6 +147,7 @@ impl DroneMetrics {
         registry.register(Box::new(requests_errors_total.clone())).expect("Failed to register requests_errors_total");
         registry.register(Box::new(request_duration_seconds.clone())).expect("Failed to register request_duration_seconds");
         registry.register(Box::new(backend_duration_seconds.clone())).expect("Failed to register backend_duration_seconds");
+        registry.register(Box::new(streamed_response_bytes.clone())).expect("Failed to register streamed_response_bytes");
         registry.register(Box::new(cache_size_bytes.clone())).expect("Failed to register cache_size_bytes");
         registry.register(Box::new(cache_entries.clone())).expect("Failed to register cache_entries");
         registry.register(Box::new(active_requests.clone())).expect("Failed to register active_requests");
@@ -144,6 +163,7 @@ impl DroneMetrics {
             requests_errors_total,
             request_duration_seconds,
             backend_duration_seconds,
+            streamed_response_bytes,
             cache_size_bytes,
             cache_entries,
             active_requests,
@@ -227,6 +247,19 @@ impl DroneMetrics {
         self.backend_duration_seconds
             .with_label_values(&[namespace, api, method, backend])
             .observe(duration_seconds);
+    }
+
+    /// Record the size of a response streamed from the backend
+    pub fn record_streamed_response(
+        &self,
+        namespace: &str,
+        api: &str,
+        method: &str,
+        bytes: u64
+    ) {
+        self.streamed_response_bytes
+            .with_label_values(&[namespace, api, method])
+            .observe(bytes as f64);
     }
 
     /// Update cache metrics
