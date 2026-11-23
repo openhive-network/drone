@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, RwLock};
 use log::{debug, error, info, log_enabled, trace, warn, Level::Info};
 
 pub mod config;
-use config::{AppConfig, BackendInfo, DroneConfig, TtlValue};
+use config::{AppConfig, BackendInfo, TtlValue};
 
 pub mod method_renamer;
 use method_renamer::MethodAndParams;
@@ -47,7 +47,7 @@ pub mod account_history;
 use account_history::HistoryPage;
 
 pub mod client_net;
-use client_net::{Network, TrustedProxies};
+use client_net::{ClientIpResolver, Network};
 
 pub mod client_cost;
 use client_cost::ClientCostTracker;
@@ -1640,28 +1640,21 @@ fn throttled_error(request: APIRequest, network: &str, retry_after_secs: u64) ->
     }
 }
 
-/// The client's address: `CF-Connecting-IP`, else (when `trusted_proxies` is given) the address
-/// the proxy chain resolves from `X-Forwarded-For`, else the peer.  `None` when the
-/// `CF-Connecting-IP` header is not valid text.
-fn resolve_client_ip(
-    req: &HttpRequest,
-    trusted_proxies: Option<&TrustedProxies>,
-) -> Option<String> {
-    if let Some(ip) = req.headers().get("CF-Connecting-IP") {
-        return ip.to_str().map(|ip| ip.to_string()).ok();
-    }
-    let peer = req.peer_addr().unwrap().ip();
-    let client = match trusted_proxies {
-        Some(trusted_proxies) => {
-            let forwarded_for = req
-                .headers()
-                .get("X-Forwarded-For")
-                .and_then(|value| value.to_str().ok());
-            trusted_proxies.client_of(forwarded_for, peer)
-        }
-        None => peer,
+/// The client's address, resolved from the request's `CF-Connecting-IP` / `X-Forwarded-For`
+/// headers and its peer as `resolver` allows
+fn resolve_client_ip(req: &HttpRequest, resolver: &ClientIpResolver) -> String {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
     };
-    Some(client.to_string())
+    resolver
+        .resolve(
+            header("CF-Connecting-IP"),
+            header("X-Forwarded-For"),
+            req.peer_addr().unwrap().ip(),
+        )
+        .to_string()
 }
 
 async fn api_call(
@@ -1670,20 +1663,7 @@ async fn api_call(
     data: web::Data<AppData>,
     request_id: RequestId,
 ) -> impl Responder {
-    let user_ip = match resolve_client_ip(&req, data.trusted_proxies.as_ref()) {
-        Some(ip) => ip,
-        None => {
-            return HttpResponse::InternalServerError().json(json!({
-                "jsonrpc": "2.0",
-                "id": 0,
-                "error": {
-                    "code": -32000,
-                    "message": "Internal Server Error",
-                    "error": "Invalid Cloudflare Proxy Header."
-                }
-            }))
-        }
-    };
+    let user_ip = resolve_client_ip(&req, &data.client_ip_resolver);
 
     match call.0 {
         APICall::Single(request) => {
@@ -1806,8 +1786,7 @@ struct AppData {
     access_log_flush_every_line: bool,
     cost_limiter: Option<Arc<CostLimiter>>,
     client_costs: Option<ClientCostTracker>,
-    /// set when `trust_forwarded_for` is: the proxies whose `X-Forwarded-For` entries are believed
-    trusted_proxies: Option<TrustedProxies>,
+    client_ip_resolver: ClientIpResolver,
 }
 
 fn build_cache(max_capacity: u64) -> Cache<String, CacheEntry> {
@@ -1826,13 +1805,6 @@ fn build_cache(max_capacity: u64) -> Cache<String, CacheEntry> {
         .build()
 }
 
-fn trusted_proxies_of(config: &DroneConfig) -> Result<Option<TrustedProxies>, String> {
-    if !config.trust_forwarded_for {
-        return Ok(None);
-    }
-    TrustedProxies::from_config(&config.trusted_proxies).map(Some)
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -1846,7 +1818,7 @@ async fn main() -> std::io::Result<()> {
     let client_costs = ClientCostTracker::from_config(&app_config.drone)
         .unwrap_or_else(|e| panic!("Invalid client cost config: {}", e));
 
-    let trusted_proxies = trusted_proxies_of(&app_config.drone)
+    let client_ip_resolver = ClientIpResolver::from_config(&app_config.drone)
         .unwrap_or_else(|e| panic!("Invalid drone.trusted_proxies config: {}", e));
 
     // Initialize metrics
@@ -1954,7 +1926,7 @@ async fn main() -> std::io::Result<()> {
         access_log_flush_every_line,
         cost_limiter,
         client_costs,
-        trusted_proxies,
+        client_ip_resolver,
     });
 
     let metrics_enabled = app_config.drone.metrics_enabled;
@@ -2012,9 +1984,8 @@ async fn main() -> std::io::Result<()> {
 mod tests {
     use super::{
         api_call, build_cache, config, history_page_ttl, is_block_result_empty, metrics_handler,
-        resolve_client_ip, trusted_proxies_of, AppData, BlockchainState, CacheTtl, ChannelBody,
-        ClientCostTracker, CostLimiter, DroneMetrics, HistoryPage, TrustedProxies,
-        UpstreamJsonRpcResponse,
+        resolve_client_ip, AppData, BlockchainState, CacheTtl, ChannelBody, ClientCostTracker,
+        ClientIpResolver, CostLimiter, DroneMetrics, HistoryPage, UpstreamJsonRpcResponse,
     };
     use actix_request_identifier::RequestIdentifier;
     use actix_web::body::{BodySize, MessageBody};
@@ -2128,29 +2099,59 @@ mod tests {
         assert!(e.error.is_none());
     }
 
+    /// A resolver for the `drone` section with `drone_yaml` (`key: value, ...`) added
+    fn client_ip_resolver(drone_yaml: &str) -> ClientIpResolver {
+        let drone: config::DroneConfig = serde_yaml::from_str(&format!(
+            "{{port: 0, hostname: h, cache_max_capacity: 1, operator_message: m, middleware_connection_threads: 1, {drone_yaml}}}"
+        ))
+        .unwrap();
+        ClientIpResolver::from_config(&drone).unwrap()
+    }
+
     #[test]
     fn client_ip_comes_from_x_forwarded_for_only_when_trusted() {
         let peer = "10.0.0.1:5000".parse().unwrap();
-        let one_hop = TrustedProxies::from_config(&[]).unwrap();
         let spoofed = actix_test::TestRequest::default()
             .peer_addr(peer)
             .insert_header(("X-Forwarded-For", "1.2.3.4, 203.0.113.7"))
             .to_http_request();
         assert_eq!(
-            resolve_client_ip(&spoofed, Some(&one_hop)).as_deref(),
-            Some("203.0.113.7")
+            resolve_client_ip(&spoofed, &client_ip_resolver("trust_forwarded_for: true")),
+            "203.0.113.7"
         );
-        assert_eq!(resolve_client_ip(&spoofed, None).as_deref(), Some("10.0.0.1"));
-
-        let cloudflare = actix_test::TestRequest::default()
-            .peer_addr(peer)
-            .insert_header(("CF-Connecting-IP", "198.51.100.4"))
-            .insert_header(("X-Forwarded-For", "203.0.113.7"))
-            .to_http_request();
         assert_eq!(
-            resolve_client_ip(&cloudflare, Some(&one_hop)).as_deref(),
-            Some("198.51.100.4")
+            resolve_client_ip(&spoofed, &client_ip_resolver("")),
+            "10.0.0.1"
         );
+    }
+
+    #[test]
+    fn client_ip_comes_from_cf_connecting_ip_only_when_enabled_and_the_peer_is_trusted() {
+        let request = |peer: &str| {
+            actix_test::TestRequest::default()
+                .peer_addr(peer.parse().unwrap())
+                .insert_header(("CF-Connecting-IP", "203.0.113.7"))
+                .insert_header(("X-Forwarded-For", "198.51.100.4"))
+                .to_http_request()
+        };
+        let trusted = "trusted_proxies: [10.0.0.0/8]";
+        let from_proxy = request("10.0.0.1:5000");
+        let direct = request("192.0.2.5:5000");
+
+        assert_eq!(
+            resolve_client_ip(&from_proxy, &client_ip_resolver("")),
+            "10.0.0.1"
+        );
+        assert_eq!(
+            resolve_client_ip(
+                &from_proxy,
+                &client_ip_resolver(&format!("trust_forwarded_for: true, {trusted}"))
+            ),
+            "198.51.100.4"
+        );
+        let cf_on = client_ip_resolver(&format!("trust_cf_connecting_ip: true, {trusted}"));
+        assert_eq!(resolve_client_ip(&from_proxy, &cf_on), "203.0.113.7");
+        assert_eq!(resolve_client_ip(&direct, &cf_on), "192.0.2.5");
     }
 
     const BACKEND_RESULT_BYTES: usize = 1000;
@@ -2259,7 +2260,7 @@ cost_limit: {cost_limit_yaml}
                 .unwrap()
                 .map(Arc::new),
             client_costs: ClientCostTracker::from_config(&app_config.drone).unwrap(),
-            trusted_proxies: trusted_proxies_of(&app_config.drone).unwrap(),
+            client_ip_resolver: ClientIpResolver::from_config(&app_config.drone).unwrap(),
             config: app_config,
             blockchain_state: Arc::new(RwLock::new(BlockchainState::new())),
             metrics: Arc::new(DroneMetrics::new("drone_test")),
@@ -2306,6 +2307,38 @@ cost_limit: {cost_limit_yaml}
             )
             .await;
             statuses.push(response.status().as_u16());
+        }
+        assert_eq!(statuses, [200, 200, 429]);
+    }
+
+    #[actix_web::test]
+    async fn rotating_cf_connecting_ip_does_not_escape_the_cost_limit() {
+        let (backend_url, _backend_calls) = start_backend();
+        // two misses (about 2 x 1000 bytes) exceed the budget
+        let data = web::Data::new(app_data_with(
+            &backend_url,
+            "{enabled: true, window_seconds: 60, response_bytes: 1500}",
+            "",
+        ));
+        let app = actix_test::init_service(
+            App::new()
+                .wrap(RequestIdentifier::with_uuid())
+                .app_data(data.clone())
+                .route("/", web::post().to(api_call)),
+        )
+        .await;
+
+        let mut statuses = Vec::new();
+        for (spoofed, account) in [("1.2.3.4", "a"), ("5.6.7.8", "b"), ("9.10.11.12", "c")] {
+            let request = call("203.0.113.7", get_accounts(account))
+                .insert_header(("CF-Connecting-IP", spoofed))
+                .to_request();
+            statuses.push(
+                actix_test::call_service(&app, request)
+                    .await
+                    .status()
+                    .as_u16(),
+            );
         }
         assert_eq!(statuses, [200, 200, 429]);
     }

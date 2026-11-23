@@ -1,6 +1,8 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::config::DroneConfig;
+
 /// A client network, the unit client cost is accounted and limited per: an IPv4 /24 or an IPv6 /64
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Network(IpAddr);
@@ -161,9 +163,50 @@ impl TrustedProxies {
     }
 }
 
+/// Which request headers name the client, and which peers they are believed from
+#[derive(Debug, Clone)]
+pub struct ClientIpResolver {
+    proxies: TrustedProxies,
+    trust_forwarded_for: bool,
+    trust_cf_connecting_ip: bool,
+}
+
+impl ClientIpResolver {
+    pub fn from_config(config: &DroneConfig) -> Result<ClientIpResolver, String> {
+        Ok(ClientIpResolver {
+            proxies: TrustedProxies::from_config(&config.trusted_proxies)?,
+            trust_forwarded_for: config.trust_forwarded_for,
+            trust_cf_connecting_ip: config.trust_cf_connecting_ip,
+        })
+    }
+
+    /// The client address of a request that reached drone from `peer`.  `cf_connecting_ip` is
+    /// believed only when enabled, the peer is listed in the trusted proxies (an empty list
+    /// trusts no peer for it) and it parses as an address; otherwise `forwarded_for` is resolved
+    /// as `TrustedProxies::client_of` does when enabled, else the peer is the client.
+    pub fn resolve(
+        &self,
+        cf_connecting_ip: Option<&str>,
+        forwarded_for: Option<&str>,
+        peer: IpAddr,
+    ) -> IpAddr {
+        if self.trust_cf_connecting_ip && self.proxies.trusts(canonical(peer)) {
+            if let Some(ip) = cf_connecting_ip.and_then(parse_client_ip) {
+                return ip;
+            }
+        }
+        if self.trust_forwarded_for {
+            self.proxies.client_of(forwarded_for, peer)
+        } else {
+            canonical(peer)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Network, TrustedProxies};
+    use super::{ClientIpResolver, Network, TrustedProxies};
+    use crate::config::DroneConfig;
     use std::net::IpAddr;
 
     fn network_of(client_ip: &str) -> Option<String> {
@@ -226,7 +269,10 @@ mod tests {
         let spoofed = Some("1.2.3.4, 203.0.113.7");
         assert_eq!(client_of(&[], spoofed, "10.0.0.1"), "203.0.113.7");
         assert_eq!(client_of(&["10.0.0.1"], spoofed, "10.0.0.1"), "203.0.113.7");
-        assert_eq!(client_of(&[], Some("203.0.113.7"), "10.0.0.1"), "203.0.113.7");
+        assert_eq!(
+            client_of(&[], Some("203.0.113.7"), "10.0.0.1"),
+            "203.0.113.7"
+        );
     }
 
     #[test]
@@ -238,7 +284,11 @@ mod tests {
             "203.0.113.7"
         );
         assert_eq!(
-            client_of(&trusted, Some("1.2.3.4, 203.0.113.7, 198.51.100.9"), "10.0.0.1"),
+            client_of(
+                &trusted,
+                Some("1.2.3.4, 203.0.113.7, 198.51.100.9"),
+                "10.0.0.1"
+            ),
             "203.0.113.7"
         );
         assert_eq!(
@@ -255,21 +305,131 @@ mod tests {
     fn untrusted_peers_and_trusted_only_chains_do_not_follow_client_entries() {
         let trusted = ["10.0.0.0/8"];
         // a client connecting directly cannot choose its address
-        assert_eq!(client_of(&trusted, Some("1.2.3.4"), "203.0.113.7"), "203.0.113.7");
+        assert_eq!(
+            client_of(&trusted, Some("1.2.3.4"), "203.0.113.7"),
+            "203.0.113.7"
+        );
         // garbage left of the last trusted hop is not followed past
         assert_eq!(
             client_of(&trusted, Some("1.2.3.4, not-an-ip, 10.0.0.2"), "10.0.0.1"),
             "10.0.0.2"
         );
-        assert_eq!(client_of(&trusted, Some("10.0.0.3, 10.0.0.2"), "10.0.0.1"), "10.0.0.3");
+        assert_eq!(
+            client_of(&trusted, Some("10.0.0.3, 10.0.0.2"), "10.0.0.1"),
+            "10.0.0.3"
+        );
         assert_eq!(client_of(&[], None, "10.0.0.1"), "10.0.0.1");
         assert_eq!(client_of(&[], Some(""), "10.0.0.1"), "10.0.0.1");
+    }
+
+    fn resolve(
+        trust_forwarded_for: bool,
+        trust_cf_connecting_ip: bool,
+        trusted: &[&str],
+        cf_connecting_ip: Option<&str>,
+        forwarded_for: Option<&str>,
+        peer: &str,
+    ) -> String {
+        let config: DroneConfig = serde_yaml::from_str(&format!(
+            "{{port: 0, hostname: h, cache_max_capacity: 1, operator_message: m, middleware_connection_threads: 1, \
+             trust_forwarded_for: {trust_forwarded_for}, trust_cf_connecting_ip: {trust_cf_connecting_ip}, \
+             trusted_proxies: [{}]}}",
+            trusted.join(", ")
+        ))
+        .unwrap();
+        ClientIpResolver::from_config(&config)
+            .unwrap()
+            .resolve(
+                cf_connecting_ip,
+                forwarded_for,
+                peer.parse::<IpAddr>().unwrap(),
+            )
+            .to_string()
+    }
+
+    #[test]
+    fn cf_connecting_ip_is_ignored_unless_enabled() {
+        let cf = Some("203.0.113.7");
+        assert_eq!(resolve(false, false, &[], cf, None, "10.0.0.1"), "10.0.0.1");
+        assert_eq!(
+            resolve(false, false, &["10.0.0.0/8"], cf, None, "10.0.0.1"),
+            "10.0.0.1"
+        );
+        assert_eq!(
+            resolve(
+                true,
+                false,
+                &["10.0.0.0/8"],
+                cf,
+                Some("198.51.100.4"),
+                "10.0.0.1"
+            ),
+            "198.51.100.4"
+        );
+    }
+
+    #[test]
+    fn cf_connecting_ip_is_believed_only_from_a_trusted_peer() {
+        let cf = Some("203.0.113.7");
+        let trusted = ["10.0.0.0/8"];
+        assert_eq!(
+            resolve(false, true, &trusted, cf, None, "10.0.0.1"),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            resolve(false, true, &trusted, cf, None, "::ffff:10.0.0.1"),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            resolve(true, true, &trusted, cf, Some("198.51.100.4"), "10.0.0.1"),
+            "203.0.113.7"
+        );
+        // a client connecting directly cannot choose its address
+        assert_eq!(
+            resolve(false, true, &trusted, cf, None, "192.0.2.5"),
+            "192.0.2.5"
+        );
+        assert_eq!(
+            resolve(true, true, &trusted, cf, Some("198.51.100.4"), "192.0.2.5"),
+            "192.0.2.5"
+        );
+        // an empty list trusts no peer for CF-Connecting-IP
+        assert_eq!(resolve(false, true, &[], cf, None, "10.0.0.1"), "10.0.0.1");
+        assert_eq!(
+            resolve(true, true, &[], cf, Some("198.51.100.4"), "10.0.0.1"),
+            "198.51.100.4"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_cf_connecting_ip_falls_back_to_forwarded_for_and_peer() {
+        let trusted = ["10.0.0.0/8"];
+        for cf in ["not-an-ip", ""] {
+            assert_eq!(
+                resolve(
+                    true,
+                    true,
+                    &trusted,
+                    Some(cf),
+                    Some("198.51.100.4"),
+                    "10.0.0.1"
+                ),
+                "198.51.100.4"
+            );
+            assert_eq!(
+                resolve(false, true, &trusted, Some(cf), None, "10.0.0.1"),
+                "10.0.0.1"
+            );
+        }
     }
 
     #[test]
     fn invalid_trusted_proxies_are_rejected() {
         for entry in ["not-an-ip", "10.0.0.0/33", "2001:db8::/129"] {
-            assert!(TrustedProxies::from_config(&[entry.to_string()]).is_err(), "{entry}");
+            assert!(
+                TrustedProxies::from_config(&[entry.to_string()]).is_err(),
+                "{entry}"
+            );
         }
     }
 }

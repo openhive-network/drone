@@ -30,9 +30,16 @@ drone:
   # one of trusted_proxies, so addresses a client puts in its own X-Forwarded-For are ignored.
   # trusted_proxies empty: one proxy hop, the right-most entry is the client.  With two or more
   # hops (e.g. a CDN in front of a local proxy) list every proxy; a connection from a peer
-  # outside the list then has its X-Forwarded-For ignored.  CF-Connecting-IP, when present,
-  # takes precedence over both.
+  # outside the list then has its X-Forwarded-For ignored.
   trust_forwarded_for: false
+  # Take the client IP from Cloudflare's CF-Connecting-IP header.  It is believed only on a
+  # connection from a peer listed in trusted_proxies (an empty list trusts no peer for it) and
+  # then takes precedence over X-Forwarded-For; otherwise, or when it is not an address, it is
+  # ignored.  Any client can send this header, and proxies pass it through, so it is off by
+  # default: deployments behind Cloudflare must set this and list Cloudflare's ranges
+  # (https://www.cloudflare.com/ips/), or the local proxy that Cloudflare connects to, in
+  # trusted_proxies, or every Cloudflare client is keyed by the proxy/X-Forwarded-For address.
+  trust_cf_connecting_ip: false
   trusted_proxies: []         # CIDRs or single addresses, e.g. [10.0.0.0/8, 198.51.100.0/24]
   # Prometheus metrics configuration
   metrics_enabled: true        # Enable/disable the /metrics endpoint
@@ -229,8 +236,8 @@ timeouts:
 
 # per-client-network budget for the backend cost of cache misses (off by default).
 # Clients are grouped by their /24 (IPv4) or /64 (IPv6) network, using the address from
-# CF-Connecting-IP, or X-Forwarded-For when drone.trust_forwarded_for is set.  Every cache
-# miss charges its backend time and response size (times its method weight) to the network.
+# CF-Connecting-IP / X-Forwarded-For as drone.trust_cf_connecting_ip / trust_forwarded_for
+# allow.  Every cache miss charges its backend time and response size (times its method weight) to the network.
 # The spent cost drains continuously at budget/window_seconds; while a network is over budget
 # in either resource, its cache misses are answered with HTTP 429 (JSON-RPC error -32029) and
 # a Retry-After header, without calling the backend.  Its cache hits are still served.
