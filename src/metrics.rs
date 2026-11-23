@@ -1,13 +1,11 @@
 use prometheus::{
-    CounterVec, Gauge, GaugeVec, HistogramVec,
-    Opts, Registry, HistogramOpts,
-    TextEncoder, Encoder,
+    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 
 /// Default histogram buckets for request duration (in seconds)
 /// Covers range from 1ms to 30s with good granularity
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
 /// DroneMetrics holds all Prometheus metric collectors for Drone
@@ -50,71 +48,79 @@ impl DroneMetrics {
 
         // Request counters
         let requests_total = CounterVec::new(
-            Opts::new("requests_total", "Total number of JSON-RPC requests")
-                .namespace(namespace),
-            &["namespace", "api", "method", "status"]
-        ).expect("Failed to create requests_total counter");
+            Opts::new("requests_total", "Total number of JSON-RPC requests").namespace(namespace),
+            &["namespace", "api", "method", "status"],
+        )
+        .expect("Failed to create requests_total counter");
 
         let requests_cached_total = CounterVec::new(
-            Opts::new("requests_cached_total", "Total number of cache hits")
-                .namespace(namespace),
-            &["namespace", "api", "method"]
-        ).expect("Failed to create requests_cached_total counter");
+            Opts::new("requests_cached_total", "Total number of cache hits").namespace(namespace),
+            &["namespace", "api", "method"],
+        )
+        .expect("Failed to create requests_cached_total counter");
 
         let requests_errors_total = CounterVec::new(
             Opts::new("requests_errors_total", "Total number of error responses")
                 .namespace(namespace),
-            &["namespace", "api", "method", "error_code"]
-        ).expect("Failed to create requests_errors_total counter");
+            &["namespace", "api", "method", "error_code"],
+        )
+        .expect("Failed to create requests_errors_total counter");
 
         // Latency histograms
         let request_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "request_duration_seconds",
-                "End-to-end request latency in seconds"
+                "End-to-end request latency in seconds",
             )
             .namespace(namespace)
             .buckets(REQUEST_DURATION_BUCKETS.to_vec()),
-            &["namespace", "api", "method", "cached"]
-        ).expect("Failed to create request_duration_seconds histogram");
+            &["namespace", "api", "method", "cached"],
+        )
+        .expect("Failed to create request_duration_seconds histogram");
 
         let backend_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "backend_duration_seconds",
-                "Backend call latency in seconds"
+                "Backend call latency in seconds",
             )
             .namespace(namespace)
             .buckets(REQUEST_DURATION_BUCKETS.to_vec()),
-            &["namespace", "api", "method", "backend"]
-        ).expect("Failed to create backend_duration_seconds histogram");
+            &["namespace", "api", "method", "backend"],
+        )
+        .expect("Failed to create backend_duration_seconds histogram");
 
         // Cache gauges
         let cache_size_bytes = Gauge::new(
             format!("{}_cache_size_bytes", namespace),
-            "Current cache memory usage in bytes"
-        ).expect("Failed to create cache_size_bytes gauge");
+            "Current cache memory usage in bytes",
+        )
+        .expect("Failed to create cache_size_bytes gauge");
 
         let cache_entries = Gauge::new(
             format!("{}_cache_entries", namespace),
-            "Number of entries in cache"
-        ).expect("Failed to create cache_entries gauge");
+            "Number of entries in cache",
+        )
+        .expect("Failed to create cache_entries gauge");
 
         // Active requests gauge
         let active_requests = Gauge::new(
             format!("{}_active_requests", namespace),
-            "Number of in-flight requests"
-        ).expect("Failed to create active_requests gauge");
+            "Number of in-flight requests",
+        )
+        .expect("Failed to create active_requests gauge");
 
         // Blockchain state gauges
         let blockchain_head_block = Gauge::new(
             format!("{}_blockchain_head_block", namespace),
-            "Current head block number"
-        ).expect("Failed to create blockchain_head_block gauge");
+            "Current head block number",
+        )
+        .expect("Failed to create blockchain_head_block gauge");
 
         let blockchain_lib = Gauge::new(
             format!("{}_blockchain_lib", namespace),
-            "Last irreversible block number"
-        ).expect("Failed to create blockchain_lib gauge");
+            "Last irreversible block number",
+        )
+        .expect("Failed to create blockchain_lib gauge");
 
         let cost_limit_throttled_total = CounterVec::new(
             Opts::new("cost_limit_throttled_total", "Cache-missing requests refused because the client network was over its cost budget")
@@ -123,10 +129,14 @@ impl DroneMetrics {
         ).expect("Failed to create cost_limit_throttled_total counter");
 
         let cost_limit_usage_ratio = GaugeVec::new(
-            Opts::new("cost_limit_usage_ratio", "Cost a client network has spent, as a fraction of its budget")
-                .namespace(namespace),
-            &["network", "resource"]
-        ).expect("Failed to create cost_limit_usage_ratio gauge");
+            Opts::new(
+                "cost_limit_usage_ratio",
+                "Cost a client network has spent, as a fraction of its budget",
+            )
+            .namespace(namespace),
+            &["network", "resource"],
+        )
+        .expect("Failed to create cost_limit_usage_ratio gauge");
 
         let client_net_backend_seconds_total = CounterVec::new(
             Opts::new("client_net_backend_seconds_total", "Backend seconds spent on cache misses of a client network (top networks by recent backend seconds, the rest as \"other\")")
@@ -147,21 +157,51 @@ impl DroneMetrics {
         ).expect("Failed to create client_net_requests_total counter");
 
         // Register all metrics
-        registry.register(Box::new(requests_total.clone())).expect("Failed to register requests_total");
-        registry.register(Box::new(requests_cached_total.clone())).expect("Failed to register requests_cached_total");
-        registry.register(Box::new(requests_errors_total.clone())).expect("Failed to register requests_errors_total");
-        registry.register(Box::new(request_duration_seconds.clone())).expect("Failed to register request_duration_seconds");
-        registry.register(Box::new(backend_duration_seconds.clone())).expect("Failed to register backend_duration_seconds");
-        registry.register(Box::new(cache_size_bytes.clone())).expect("Failed to register cache_size_bytes");
-        registry.register(Box::new(cache_entries.clone())).expect("Failed to register cache_entries");
-        registry.register(Box::new(active_requests.clone())).expect("Failed to register active_requests");
-        registry.register(Box::new(blockchain_head_block.clone())).expect("Failed to register blockchain_head_block");
-        registry.register(Box::new(blockchain_lib.clone())).expect("Failed to register blockchain_lib");
-        registry.register(Box::new(cost_limit_throttled_total.clone())).expect("Failed to register cost_limit_throttled_total");
-        registry.register(Box::new(cost_limit_usage_ratio.clone())).expect("Failed to register cost_limit_usage_ratio");
-        registry.register(Box::new(client_net_backend_seconds_total.clone())).expect("Failed to register client_net_backend_seconds_total");
-        registry.register(Box::new(client_net_response_bytes_total.clone())).expect("Failed to register client_net_response_bytes_total");
-        registry.register(Box::new(client_net_requests_total.clone())).expect("Failed to register client_net_requests_total");
+        registry
+            .register(Box::new(requests_total.clone()))
+            .expect("Failed to register requests_total");
+        registry
+            .register(Box::new(requests_cached_total.clone()))
+            .expect("Failed to register requests_cached_total");
+        registry
+            .register(Box::new(requests_errors_total.clone()))
+            .expect("Failed to register requests_errors_total");
+        registry
+            .register(Box::new(request_duration_seconds.clone()))
+            .expect("Failed to register request_duration_seconds");
+        registry
+            .register(Box::new(backend_duration_seconds.clone()))
+            .expect("Failed to register backend_duration_seconds");
+        registry
+            .register(Box::new(cache_size_bytes.clone()))
+            .expect("Failed to register cache_size_bytes");
+        registry
+            .register(Box::new(cache_entries.clone()))
+            .expect("Failed to register cache_entries");
+        registry
+            .register(Box::new(active_requests.clone()))
+            .expect("Failed to register active_requests");
+        registry
+            .register(Box::new(blockchain_head_block.clone()))
+            .expect("Failed to register blockchain_head_block");
+        registry
+            .register(Box::new(blockchain_lib.clone()))
+            .expect("Failed to register blockchain_lib");
+        registry
+            .register(Box::new(cost_limit_throttled_total.clone()))
+            .expect("Failed to register cost_limit_throttled_total");
+        registry
+            .register(Box::new(cost_limit_usage_ratio.clone()))
+            .expect("Failed to register cost_limit_usage_ratio");
+        registry
+            .register(Box::new(client_net_backend_seconds_total.clone()))
+            .expect("Failed to register client_net_backend_seconds_total");
+        registry
+            .register(Box::new(client_net_response_bytes_total.clone()))
+            .expect("Failed to register client_net_response_bytes_total");
+        registry
+            .register(Box::new(client_net_requests_total.clone()))
+            .expect("Failed to register client_net_requests_total");
 
         DroneMetrics {
             registry,
@@ -188,7 +228,9 @@ impl DroneMetrics {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).expect("Failed to encode metrics");
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .expect("Failed to encode metrics");
         String::from_utf8(buffer).expect("Failed to convert metrics to string")
     }
 
@@ -199,7 +241,7 @@ impl DroneMetrics {
         api: &str,
         method: &str,
         cached: bool,
-        duration_seconds: f64
+        duration_seconds: f64,
     ) {
         let cached_str = if cached { "true" } else { "false" };
 
@@ -226,7 +268,7 @@ impl DroneMetrics {
         method: &str,
         error_code: i32,
         cached: bool,
-        duration_seconds: f64
+        duration_seconds: f64,
     ) {
         let cached_str = if cached { "true" } else { "false" };
         let error_code_str = error_code.to_string();
@@ -251,7 +293,7 @@ impl DroneMetrics {
         api: &str,
         method: &str,
         backend: &str,
-        duration_seconds: f64
+        duration_seconds: f64,
     ) {
         self.backend_duration_seconds
             .with_label_values(&[namespace, api, method, backend])
@@ -278,7 +320,10 @@ impl DroneMetrics {
     }
 
     /// Replace the per-network budget usage with `ratios` of (network, resource, ratio)
-    pub fn update_cost_limit_usage<'a>(&self, ratios: impl IntoIterator<Item = (&'a str, &'a str, f64)>) {
+    pub fn update_cost_limit_usage<'a>(
+        &self,
+        ratios: impl IntoIterator<Item = (&'a str, &'a str, f64)>,
+    ) {
         self.cost_limit_usage_ratio.reset();
         for (network, resource, ratio) in ratios {
             self.cost_limit_usage_ratio

@@ -18,7 +18,11 @@ pub enum HistoryPage {
 /// (`{"history": [...]}`, named params).  A page is `Fixed` only when the request names an
 /// explicit, unfiltered `start`, the result's last sequence number equals `start`, and every
 /// operation is in a block at or below `last_irreversible_block_number`.
-pub fn classify_page(params: Option<&Value>, result: &Value, last_irreversible_block_number: u32) -> HistoryPage {
+pub fn classify_page(
+    params: Option<&Value>,
+    result: &Value,
+    last_irreversible_block_number: u32,
+) -> HistoryPage {
     let entries = match result.get("history").unwrap_or(result).as_array() {
         Some(entries) => entries,
         None => return HistoryPage::Mutable,
@@ -32,7 +36,10 @@ pub fn classify_page(params: Option<&Value>, result: &Value, last_irreversible_b
         None => return HistoryPage::Mutable,
     };
 
-    let last_seq = entries.last().and_then(|entry| entry.get(0)).and_then(Value::as_u64);
+    let last_seq = entries
+        .last()
+        .and_then(|entry| entry.get(0))
+        .and_then(Value::as_u64);
     if last_seq != Some(start) {
         return HistoryPage::Mutable;
     }
@@ -44,7 +51,11 @@ pub fn classify_page(params: Option<&Value>, result: &Value, last_irreversible_b
             None => return HistoryPage::Mutable,
         }
     }
-    if highest_block <= last_irreversible_block_number as u64 { HistoryPage::Fixed } else { HistoryPage::Mutable }
+    if highest_block <= last_irreversible_block_number as u64 {
+        HistoryPage::Fixed
+    } else {
+        HistoryPage::Mutable
+    }
 }
 
 /// The request's `start`, unless it is -1 (newest page), missing, or the request uses an operation
@@ -53,7 +64,11 @@ pub fn classify_page(params: Option<&Value>, result: &Value, last_irreversible_b
 fn explicit_unfiltered_start(params: &Value) -> Option<u64> {
     let (start, filter_low, filter_high) = match params {
         Value::Array(positional) => (positional.get(1), positional.get(3), positional.get(4)),
-        Value::Object(named) => (named.get("start"), named.get("operation_filter_low"), named.get("operation_filter_high")),
+        Value::Object(named) => (
+            named.get("start"),
+            named.get("operation_filter_low"),
+            named.get("operation_filter_high"),
+        ),
         _ => return None,
     };
     if is_filter_set(filter_low) || is_filter_set(filter_high) {
@@ -79,7 +94,12 @@ mod tests {
     const LIB: u32 = 1000;
 
     fn condenser_result(entries: &[(u64, u64)]) -> Value {
-        Value::Array(entries.iter().map(|(seq, block)| json!([seq, {"block": block, "op": ["vote", {}]}])).collect())
+        Value::Array(
+            entries
+                .iter()
+                .map(|(seq, block)| json!([seq, {"block": block, "op": ["vote", {}]}]))
+                .collect(),
+        )
     }
 
     fn history_api_result(entries: &[(u64, u64)]) -> Value {
@@ -97,58 +117,139 @@ mod tests {
     #[test]
     fn complete_irreversible_page_is_fixed() {
         let entries = [(8, 990), (9, 995), (10, 1000)];
-        assert_eq!(classify_page(Some(&condenser_params(10)), &condenser_result(&entries), LIB), HistoryPage::Fixed);
-        assert_eq!(classify_page(Some(&history_api_params(10)), &history_api_result(&entries), LIB), HistoryPage::Fixed);
+        assert_eq!(
+            classify_page(
+                Some(&condenser_params(10)),
+                &condenser_result(&entries),
+                LIB
+            ),
+            HistoryPage::Fixed
+        );
+        assert_eq!(
+            classify_page(
+                Some(&history_api_params(10)),
+                &history_api_result(&entries),
+                LIB
+            ),
+            HistoryPage::Fixed
+        );
     }
 
     #[test]
     fn start_past_newest_operation_is_mutable() {
         let entries = [(8, 990), (9, 995), (10, 1000)];
-        assert_eq!(classify_page(Some(&condenser_params(50)), &condenser_result(&entries), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&history_api_params(50)), &history_api_result(&entries), LIB), HistoryPage::Mutable);
+        assert_eq!(
+            classify_page(
+                Some(&condenser_params(50)),
+                &condenser_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(
+                Some(&history_api_params(50)),
+                &history_api_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
     }
 
     #[test]
     fn page_with_reversible_operation_is_mutable() {
         let entries = [(8, 990), (9, 1001), (10, 999)];
-        assert_eq!(classify_page(Some(&condenser_params(10)), &condenser_result(&entries), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&history_api_params(10)), &history_api_result(&entries), LIB), HistoryPage::Mutable);
+        assert_eq!(
+            classify_page(
+                Some(&condenser_params(10)),
+                &condenser_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(
+                Some(&history_api_params(10)),
+                &history_api_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
     }
 
     #[test]
     fn newest_page_request_is_mutable() {
         let entries = [(8, 990), (9, 995), (10, 1000)];
-        assert_eq!(classify_page(Some(&condenser_params(-1)), &condenser_result(&entries), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&history_api_params(-1)), &history_api_result(&entries), LIB), HistoryPage::Mutable);
+        assert_eq!(
+            classify_page(
+                Some(&condenser_params(-1)),
+                &condenser_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(
+                Some(&history_api_params(-1)),
+                &history_api_result(&entries),
+                LIB
+            ),
+            HistoryPage::Mutable
+        );
     }
 
     #[test]
     fn empty_page_is_empty() {
-        assert_eq!(classify_page(Some(&condenser_params(10)), &condenser_result(&[]), LIB), HistoryPage::Empty);
-        assert_eq!(classify_page(Some(&history_api_params(10)), &history_api_result(&[]), LIB), HistoryPage::Empty);
+        assert_eq!(
+            classify_page(Some(&condenser_params(10)), &condenser_result(&[]), LIB),
+            HistoryPage::Empty
+        );
+        assert_eq!(
+            classify_page(Some(&history_api_params(10)), &history_api_result(&[]), LIB),
+            HistoryPage::Empty
+        );
     }
 
     #[test]
     fn filtered_request_is_mutable() {
         let entries = [(8, 990), (9, 995), (10, 1000)];
         let condenser = json!(["alice", 10, 3, 1, 0]);
-        let history_api = json!({"account": "alice", "start": 10, "limit": 3, "operation_filter_high": "4"});
-        assert_eq!(classify_page(Some(&condenser), &condenser_result(&entries), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&history_api), &history_api_result(&entries), LIB), HistoryPage::Mutable);
+        let history_api =
+            json!({"account": "alice", "start": 10, "limit": 3, "operation_filter_high": "4"});
+        assert_eq!(
+            classify_page(Some(&condenser), &condenser_result(&entries), LIB),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(Some(&history_api), &history_api_result(&entries), LIB),
+            HistoryPage::Mutable
+        );
     }
 
     #[test]
     fn zero_filter_counts_as_unfiltered() {
         let entries = [(8, 990), (9, 995), (10, 1000)];
         let condenser = json!(["alice", 10, 3, 0, "0"]);
-        assert_eq!(classify_page(Some(&condenser), &condenser_result(&entries), LIB), HistoryPage::Fixed);
+        assert_eq!(
+            classify_page(Some(&condenser), &condenser_result(&entries), LIB),
+            HistoryPage::Fixed
+        );
     }
 
     #[test]
     fn unrecognized_shapes_are_mutable() {
         let entries = [(10, 1000)];
-        assert_eq!(classify_page(None, &condenser_result(&entries), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&condenser_params(10)), &json!({"block": 5}), LIB), HistoryPage::Mutable);
-        assert_eq!(classify_page(Some(&condenser_params(10)), &json!([[10, {"op": []}]]), LIB), HistoryPage::Mutable);
+        assert_eq!(
+            classify_page(None, &condenser_result(&entries), LIB),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(Some(&condenser_params(10)), &json!({"block": 5}), LIB),
+            HistoryPage::Mutable
+        );
+        assert_eq!(
+            classify_page(Some(&condenser_params(10)), &json!([[10, {"op": []}]]), LIB),
+            HistoryPage::Mutable
+        );
     }
 }
